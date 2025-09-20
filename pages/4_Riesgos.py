@@ -31,9 +31,11 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
     if estudiantes_periodo.empty:
         return pd.DataFrame()
 
-    # Inicializar flag de vulnerabilidad
+    # Inicializar flags de vulnerabilidad
     estudiantes_periodo["vulnerable"] = False
+    estudiantes_periodo["en_riesgo"] = False
     estudiantes_periodo["motivos_vulnerabilidad"] = ""
+    estudiantes_periodo["contador_riesgos"] = 0
 
     # Obtener datos de familias
     df_universo = datos_filtrados.get("Universo Familiares", pd.DataFrame())
@@ -61,6 +63,7 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
 
                 for idx, estudiante in estudiantes_con_familia.iterrows():
                     motivos = []
+                    contador_condiciones = 0
 
                     # Verificar si familia no tiene ingresos
                     padre_sin_empleo = (
@@ -80,14 +83,17 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
                         # Ambos padres existen
                         if padre_sin_empleo and madre_sin_empleo:
                             motivos.append("Familia sin empleo")
+                            contador_condiciones += 1
                     elif tiene_padre and not tiene_madre:
                         # Solo padre existe
                         if padre_sin_empleo:
                             motivos.append("Familia sin empleo")
+                            contador_condiciones += 1
                     elif not tiene_padre and tiene_madre:
                         # Solo madre existe
                         if madre_sin_empleo:
                             motivos.append("Familia sin empleo")
+                            contador_condiciones += 1
 
                     # Criterio 2: Deudas familiares en calificación D o E
                     if not df_deudas.empty:
@@ -115,14 +121,26 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
                                     ].isin(["D", "E"])
                                     if calificaciones_riesgo.any():
                                         motivos.append("Deuda familiar crítica (D/E)")
+                                        contador_condiciones += 1
 
-                    # Actualizar vulnerabilidad
-                    if motivos:
+                    # Actualizar vulnerabilidad según el contador de condiciones
+                    if contador_condiciones > 0:
                         idx_original = estudiantes_periodo.index[
                             estudiantes_periodo["identificacion"]
                             == estudiante["identificacion"]
                         ][0]
-                        estudiantes_periodo.loc[idx_original, "vulnerable"] = True
+                        
+                        # Asignar categoría según el número de condiciones
+                        if contador_condiciones >= 2:
+                            # Rojo: Alta vulnerabilidad (2 o más condiciones)
+                            estudiantes_periodo.loc[idx_original, "vulnerable"] = True
+                            estudiantes_periodo.loc[idx_original, "en_riesgo"] = False
+                        else:
+                            # Amarillo: En situación de riesgo (1 condición)
+                            estudiantes_periodo.loc[idx_original, "vulnerable"] = False
+                            estudiantes_periodo.loc[idx_original, "en_riesgo"] = True
+                        
+                        estudiantes_periodo.loc[idx_original, "contador_riesgos"] = contador_condiciones
                         estudiantes_periodo.loc[
                             idx_original, "motivos_vulnerabilidad"
                         ] = "; ".join(motivos)
@@ -151,40 +169,39 @@ def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
             {
                 "identificacion": "count",  # Total estudiantes
                 "vulnerable": "sum",  # Estudiantes vulnerables
+                "en_riesgo": "sum",  # Estudiantes en riesgo
             }
         )
         .reset_index()
     )
 
-    stats_facultad.columns = ["facultad", "total_estudiantes", "vulnerables"]
+    stats_facultad.columns = ["facultad", "total_estudiantes", "vulnerables", "en_riesgo"]
 
-    # Calcular tasa de vulnerabilidad
-    stats_facultad["tasa_vulnerabilidad"] = (
-        stats_facultad["vulnerables"] / stats_facultad["total_estudiantes"] * 100
-    )
+    # Agregar total de estudiantes con algún tipo de riesgo
+    stats_facultad["total_con_riesgo"] = stats_facultad["vulnerables"] + stats_facultad["en_riesgo"]
 
-    # Filtrar solo facultades con estudiantes vulnerables
-    stats_facultad = stats_facultad[stats_facultad["vulnerables"] > 0]
+    # Filtrar solo facultades con estudiantes en algún tipo de riesgo
+    stats_facultad = stats_facultad[stats_facultad["total_con_riesgo"] > 0]
 
     if stats_facultad.empty:
         return None
 
-    # Ordenar por número de vulnerables y tomar top 5
-    top_facultades = stats_facultad.sort_values("vulnerables", ascending=False).head(5)
+    # Ordenar por total con riesgo y tomar top 5
+    top_facultades = stats_facultad.sort_values("total_con_riesgo", ascending=False).head(5)
 
     # Crear gráfico de barras
     fig = px.bar(
         top_facultades,
-        x="vulnerables",
+        x="total_con_riesgo",
         y="facultad",
         orientation="h",
-        title=f"Top 5 Facultades con Más Estudiantes Vulnerables - Enrollment {periodo}",
+        title=f"Top 5 Facultades con Más Estudiantes en Situación de Riesgo - Enrollment {periodo}",
         labels={
-            "vulnerables": "Número de Estudiantes Vulnerables",
+            "total_con_riesgo": "Número de Estudiantes en Riesgo",
             "facultad": "Facultad",
         },
-        text="vulnerables",
-        color="tasa_vulnerabilidad",
+        text="total_con_riesgo",
+        color="vulnerables",
         color_continuous_scale="Reds",
     )
 
@@ -193,16 +210,16 @@ def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
         textposition="inside",
         texttemplate="%{text}",
         hovertemplate="<b>%{y}</b><br>"
-        + "Estudiantes vulnerables: %{x}<br>"
-        + "Tasa de vulnerabilidad: %{marker.color:.1f}%<br>"
+        + "Total en riesgo: %{x}<br>"
+        + "Alta vulnerabilidad: %{marker.color}<br>"
         + "<extra></extra>",
     )
 
     fig.update_layout(
         height=400,
         yaxis=dict(categoryorder="total ascending"),
-        xaxis=dict(title="Número de Estudiantes Vulnerables"),
-        coloraxis_colorbar=dict(title="Tasa de Vulnerabilidad (%)"),
+        xaxis=dict(title="Número de Estudiantes en Riesgo"),
+        coloraxis_colorbar=dict(title="Estudiantes con Alta Vulnerabilidad"),
     )
 
     return fig
@@ -284,12 +301,8 @@ if periodos:
     if not estudiantes_vulnerables.empty:
         # Mostrar métricas generales
         total_estudiantes = len(estudiantes_vulnerables)
-        estudiantes_en_riesgo = estudiantes_vulnerables["vulnerable"].sum()
-        tasa_vulnerabilidad = (
-            (estudiantes_en_riesgo / total_estudiantes * 100)
-            if total_estudiantes > 0
-            else 0
-        )
+        estudiantes_alta_vulnerabilidad = estudiantes_vulnerables["vulnerable"].sum()
+        estudiantes_en_situacion_riesgo = estudiantes_vulnerables["en_riesgo"].sum()
 
         col1, col2, col3, col4 = st.columns(4)
 
@@ -298,18 +311,18 @@ if periodos:
 
         with col2:
             tarjeta_simple(
-                "En Situación Vulnerable", f"{estudiantes_en_riesgo}", COLORES["rojo"]
+                "Alta Vulnerabilidad", f"{estudiantes_alta_vulnerabilidad}", COLORES["rojo"]
             )
 
         with col3:
             tarjeta_simple(
-                "Tasa de Vulnerabilidad",
-                f"{tasa_vulnerabilidad:.1f}%",
+                "En Situación de Riesgo",
+                f"{estudiantes_en_situacion_riesgo}",
                 COLORES["naranja"],
             )
 
         with col4:
-            estudiantes_seguros = total_estudiantes - estudiantes_en_riesgo
+            estudiantes_seguros = total_estudiantes - estudiantes_alta_vulnerabilidad - estudiantes_en_situacion_riesgo
             tarjeta_simple(
                 "Sin Riesgo Identificado", f"{estudiantes_seguros}", COLORES["verde"]
             )
@@ -328,11 +341,12 @@ if periodos:
             )
 
         # Mostrar detalles de vulnerabilidad si hay estudiantes en riesgo
-        if estudiantes_en_riesgo > 0:
+        if estudiantes_alta_vulnerabilidad > 0 or estudiantes_en_situacion_riesgo > 0:
             st.markdown("---")
             st.subheader("📋 Detalle de Estudiantes Vulnerables")
 
-            estudiantes_riesgo = estudiantes_vulnerables[
+            # Mostrar estudiantes con alta vulnerabilidad
+            estudiantes_riesgo_alto = estudiantes_vulnerables[
                 estudiantes_vulnerables["vulnerable"] == True
             ][
                 [
@@ -343,14 +357,37 @@ if periodos:
                 ]
             ]
 
-            estudiantes_riesgo.columns = [
-                "Identificación",
-                "Facultad",
-                "Carrera",
-                "Motivos de Vulnerabilidad",
+            # Mostrar estudiantes en situación de riesgo
+            estudiantes_riesgo_medio = estudiantes_vulnerables[
+                estudiantes_vulnerables["en_riesgo"] == True
+            ][
+                [
+                    "identificacion",
+                    "facultad",
+                    "carrera_homologada",
+                    "motivos_vulnerabilidad",
+                ]
             ]
 
-            st.dataframe(estudiantes_riesgo, use_container_width=True)
+            if not estudiantes_riesgo_alto.empty:
+                st.write("#### 🔴 Estudiantes con Alta Vulnerabilidad (2 o más condiciones)")
+                estudiantes_riesgo_alto.columns = [
+                    "Identificación",
+                    "Facultad",
+                    "Carrera",
+                    "Motivos de Vulnerabilidad",
+                ]
+                st.dataframe(estudiantes_riesgo_alto, use_container_width=True)
+
+            if not estudiantes_riesgo_medio.empty:
+                st.write("#### 🟡 Estudiantes en Situación de Riesgo (1 condición)")
+                estudiantes_riesgo_medio.columns = [
+                    "Identificación",
+                    "Facultad",
+                    "Carrera",
+                    "Motivos de Vulnerabilidad",
+                ]
+                st.dataframe(estudiantes_riesgo_medio, use_container_width=True)
 
     else:
         st.info("No hay datos de estudiantes disponibles para este periodo")

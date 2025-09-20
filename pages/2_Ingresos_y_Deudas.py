@@ -274,11 +274,76 @@ def crear_stacked_bar_calificacion(datos_filtrados, periodo, grupo_seleccionado)
     return fig
 
 
-def crear_bar_chart_top_deudas(top_deudas, periodo, grupo_seleccionado):
+def crear_bar_chart_top5_calificacion(datos_filtrados, periodo, grupo_seleccionado):
     """
-    Función legacy - ya no se usa
+    Crea un gráfico de barras horizontal con el top 5 de calificaciones crediticias con mayor deuda
     """
-    pass
+    df_deudas = datos_filtrados.get("Deudas", pd.DataFrame())
+    if df_deudas.empty:
+        return None
+
+    df_deudas_mes7 = df_deudas[(df_deudas["anio"] == 2025) & (df_deudas["mes"] == 7)]
+    if df_deudas_mes7.empty:
+        return None
+
+    if grupo_seleccionado == "G":
+        df_personas = datos_filtrados["Personas"]
+        graduados_periodo = df_personas[df_personas["periodo"] == periodo][
+            "identificacion"
+        ].drop_duplicates()
+        df_deudas_filtrado = df_deudas_mes7[
+            df_deudas_mes7["identificacion"].isin(graduados_periodo)
+        ]
+    else:
+        familiares_unicos = obtener_familiares_periodo(datos_filtrados, periodo)
+        if len(familiares_unicos) == 0:
+            return None
+        df_deudas_filtrado = df_deudas_mes7[
+            df_deudas_mes7["identificacion"].isin(familiares_unicos)
+        ]
+
+    if df_deudas_filtrado.empty:
+        return None
+
+    df_deudas_filtrado["calificacion_final"] = df_deudas_filtrado.apply(
+        lambda row: (
+            row["calificacion"]
+            if (pd.notna(row["calificacion"]) and row["calificacion"].strip() != "")
+            else row["cod_calificacion"]
+        ),
+        axis=1,
+    )
+
+    top5 = df_deudas_filtrado.groupby("calificacion_final")["valor"].sum().reset_index()
+    top5 = top5.sort_values("valor", ascending=False).head(5)
+    if top5.empty:
+        return None
+
+    fig = px.bar(
+        top5,
+        x="valor",
+        y="calificacion_final",
+        orientation="h",
+        title=f"Top 5 Deuda por Calificación Crediticia - {grupo_seleccionado} {periodo} (Julio 2025)",
+        text="valor",
+        color="calificacion_final",
+        color_discrete_sequence=px.colors.qualitative.Pastel,
+    )
+    fig.update_traces(
+        texttemplate="$%{text:,.0f}",
+        textposition="inside",
+    )
+    fig.update_layout(
+        xaxis_title="Valor de Deuda (USD)",
+        yaxis_title="Calificación Crediticia",
+        height=350,
+        showlegend=False,
+        xaxis=dict(tickformat="$,.0f"),
+        margin=dict(l=80, r=50, t=80, b=60),
+        plot_bgcolor="white",
+        title=dict(x=0.5, xanchor="center", font=dict(size=14)),
+    )
+    return fig
 
 
 # Configuración de la página
@@ -331,6 +396,12 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 )
                 if fig_stack:
                     st.plotly_chart(fig_stack, use_container_width=True)
+                    # Mostrar top 5 deuda por calificación
+                    fig_top5 = crear_bar_chart_top5_calificacion(
+                        datos_filtrados, periodos[0], grupo_seleccionado
+                    )
+                    if fig_top5:
+                        st.plotly_chart(fig_top5, use_container_width=True)
             else:
                 st.info("No hay datos de deudas disponibles para este periodo")
 
@@ -362,6 +433,12 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 )
                 if fig_stack:
                     st.plotly_chart(fig_stack, use_container_width=True)
+                    # Mostrar top 5 deuda por calificación
+                    fig_top5 = crear_bar_chart_top5_calificacion(
+                        datos_filtrados, periodos[1], grupo_seleccionado
+                    )
+                    if fig_top5:
+                        st.plotly_chart(fig_top5, use_container_width=True)
             else:
                 st.info("No hay datos de deudas disponibles para este periodo")
 
@@ -383,6 +460,12 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 )
                 if fig_stack:
                     st.plotly_chart(fig_stack, use_container_width=True)
+                    # Mostrar top 5 deuda por calificación
+                    fig_top5 = crear_bar_chart_top5_calificacion(
+                        datos_filtrados, periodos[0], grupo_seleccionado
+                    )
+                    if fig_top5:
+                        st.plotly_chart(fig_top5, use_container_width=True)
             else:
                 st.info("No hay datos de deudas disponibles para este periodo")
         else:
@@ -408,6 +491,12 @@ else:  # Enrollment (E)
             )
             if fig_stack:
                 st.plotly_chart(fig_stack, use_container_width=True)
+                # Mostrar top 5 deuda por calificación
+                fig_top5 = crear_bar_chart_top5_calificacion(
+                    datos_filtrados, periodos[0], grupo_seleccionado
+                )
+                if fig_top5:
+                    st.plotly_chart(fig_top5, use_container_width=True)
         else:
             st.info("No hay datos de deudas disponibles para este periodo")
     else:
