@@ -10,6 +10,44 @@ from utils.filtros import (
 )
 from utils.tarjetas import tarjeta_simple, COLORES
 import numpy as np
+from utils.hogarUnico import make_hogar_id  # 👈 para identificar hogares únicos
+from typing import Tuple, List
+import re
+
+# ====== Constantes de empleo (para los filtros) ======
+EMPLEOS_VALIDOS = ["Relacion de Dependencia", "Afiliacion Voluntaria"]
+EMPLEOS_TODOS = EMPLEOS_VALIDOS + ["Desconocido"]
+
+
+def _parse_rgba_str(rgba_str: str) -> Tuple[int, int, int, float]:
+    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\)", rgba_str.strip())
+    if not m:
+        raise ValueError(f"RGBA inválido: {rgba_str}")
+    r, g, b, a = m.groups()
+    return int(r), int(g), int(b), float(a)
+
+
+def _mix_with_white(rgb: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    # t=0 => color base, t=1 => blanco
+    r0, g0, b0 = rgb
+    r = int(round(r0 * (1.0 - t) + 255 * t))
+    g = int(round(g0 * (1.0 - t) + 255 * t))
+    b = int(round(b0 * (1.0 - t) + 255 * t))
+    return (r, g, b)
+
+
+def generar_paleta_pastel(desde_rgba: str, n: int = 10) -> List[str]:
+    base_r, base_g, base_b, _ = _parse_rgba_str(desde_rgba)
+    base_rgb: Tuple[int, int, int] = (base_r, base_g, base_b)
+    ts = np.linspace(0.0, 0.82, n)  # 0 = más fuerte, 0.82 = muy pastel
+    colores: List[str] = []
+    for t in ts:
+        r, g, b = _mix_with_white(base_rgb, float(t))
+        colores.append(f"rgba({r},{g},{b},1.0)")
+    return colores
+
+
+PALETA_AZUL_PASTEL_5 = generar_paleta_pastel("rgba(0,112,192,1.0)", n=5)
 
 
 def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
@@ -210,13 +248,6 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
 def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
     """
     Crea gráfico de barras con top 5 facultades con más estudiantes vulnerables
-
-    Args:
-        estudiantes_vulnerables: DataFrame con estudiantes y flag de vulnerabilidad
-        periodo: Periodo específico
-
-    Returns:
-        plotly.graph_objects.Figure: Gráfico de barras
     """
     if estudiantes_vulnerables.empty:
         return None
@@ -257,6 +288,9 @@ def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
         "total_con_riesgo", ascending=False
     ).head(5)
 
+    # Cantidad real de barras (por si hay <5)
+    k = len(top_facultades)
+
     # Crear gráfico de barras
     fig = px.bar(
         top_facultades,
@@ -269,8 +303,8 @@ def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
             "facultad": "Facultad",
         },
         text="total_con_riesgo",
-        color="vulnerables",
-        color_continuous_scale="Reds",
+        color="facultad",
+        color_discrete_sequence=PALETA_AZUL_PASTEL_5[:k],
     )
 
     # Personalizar
@@ -281,6 +315,7 @@ def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
         + "Total en riesgo: %{x}<br>"
         + "Alta vulnerabilidad: %{marker.color}<br>"
         + "<extra></extra>",
+        marker=dict(line=dict(color="white", width=1)),
     )
 
     fig.update_layout(
@@ -293,24 +328,123 @@ def crear_barras_facultades_vulnerables(estudiantes_vulnerables, periodo):
     return fig
 
 
-# Configuración de la página
+# ====== Helper: aplicar los 3 filtros al Universo (solo para Enrollment) ======
+def _filtrar_universo_enrollment(
+    datos_filtrados: dict,
+    periodo: str,
+    cant_papas: int | None,
+    cant_papas_trab: int | None,
+    tipo_empleo_sel: str | None,
+) -> pd.DataFrame:
+    """
+    Devuelve el 'Universo Familiares' filtrado por:
+      - cant_papas: 0/1/2 (None = Todos)
+      - cant_papas_trab: 0/1/2 (None = Todos)
+      - tipo_empleo_sel: "Todos" o uno de EMPLEOS_TODOS
+    NO toca la lógica de vulnerabilidad; solo reduce el universo antes del merge.
+    """
+    df_u = datos_filtrados.get("Universo Familiares", pd.DataFrame())
+    if df_u.empty:
+        return df_u
+
+    # Estudiantes del periodo
+    df_personas = datos_filtrados["Personas"]
+    ids = df_personas.loc[
+        df_personas["periodo"] == periodo, "identificacion"
+    ].drop_duplicates()
+    u = df_u[df_u["identificacion"].isin(ids)].copy()
+
+    # Normalizar
+    u["ced_padre"] = (
+        u["ced_padre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+    u["ced_madre"] = (
+        u["ced_madre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+
+    # Cantidad de papás en el hogar
+    u["n_papas"] = (u["ced_padre"].ne("0")).astype(int) + (
+        u["ced_madre"].ne("0")
+    ).astype(int)
+    if cant_papas in (0, 1, 2):
+        u = u[u["n_papas"] == cant_papas]
+        if u.empty:
+            return u
+
+    # Si NO hay filtros de empleo, devolvemos tal cual (tras n_papas)
+    tiene_filtro_empleo = (cant_papas_trab in (0, 1, 2)) or (
+        tipo_empleo_sel is not None and tipo_empleo_sel != "Todos"
+    )
+    if not tiene_filtro_empleo:
+        return u
+
+    # Construir hogar_id para filtrar por empleo
+    u["hogar_id"] = u.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+
+    # Mapa hogar -> familiares (solo IDs válidos)
+    pares = []
+    for _, r in u.iterrows():
+        if r["ced_padre"] != "0":
+            pares.append((r["hogar_id"], r["ced_padre"]))
+        if r["ced_madre"] != "0":
+            pares.append((r["hogar_id"], r["ced_madre"]))
+    df_mapa = pd.DataFrame(pares, columns=["hogar_id", "fam_id"]).drop_duplicates()
+
+    if df_mapa.empty:
+        # Si hay filtro de empleo y no hay fams, no pasa nadie
+        return u.iloc[0:0]
+
+    # Ingresos JUN/2025 (para tipo de empleo y "trabajando")
+    df_ing = datos_filtrados.get("Ingresos", pd.DataFrame())
+    if df_ing.empty:
+        return u.iloc[0:0]
+    ing6 = df_ing[(df_ing["anio"] == 2025) & (df_ing["mes"] == 6)].copy()
+    ing6["tipo_empleo"] = ing6["tipo_empleo"].astype(str).str.strip()
+
+    df_emp = df_mapa.merge(
+        ing6[["identificacion", "tipo_empleo"]],
+        left_on="fam_id",
+        right_on="identificacion",
+        how="left",
+    )
+    df_emp["tipo_empleo_mes6"] = df_emp["tipo_empleo"].where(
+        df_emp["tipo_empleo"].isin(EMPLEOS_VALIDOS), "Desconocido"
+    )
+    df_emp["trabaja_mes6"] = df_emp["tipo_empleo_mes6"].isin(EMPLEOS_VALIDOS)
+
+    # Filtro por tipo de empleo (si aplica)
+    if tipo_empleo_sel is not None and tipo_empleo_sel != "Todos":
+        df_emp = df_emp[df_emp["tipo_empleo_mes6"] == tipo_empleo_sel]
+        if df_emp.empty:
+            return u.iloc[0:0]
+
+    # Cantidad de papás trabajando por hogar (si aplica)
+    agg = df_emp.groupby("hogar_id", as_index=False).agg(n_trab=("trabaja_mes6", "sum"))
+
+    if cant_papas_trab in (0, 1, 2):
+        agg = agg[agg["n_trab"] == cant_papas_trab]
+        if agg.empty:
+            return u.iloc[0:0]
+
+    hogares_ok = set(agg["hogar_id"])
+    u_filtrado = u[u["hogar_id"].isin(hogares_ok)].copy()
+    return u_filtrado
+
+
+# =========================
+# Página
+# =========================
 st.set_page_config(page_title="Análisis de Riesgos", page_icon="⚠️", layout="wide")
 
 # Título principal
 st.title("⚠️ Análisis de Riesgos")
 
 # Cargar datos
-from utils.carga_datos import cargar_datos_vulnerabilidad
-
 df_vulnerabilidad = cargar_datos_vulnerabilidad()
 
 # --- Filtros personalizados (solo Enrollment) ---
-from utils.filtros import (
-    obtener_facultades_por_grupo,
-    obtener_carreras_por_grupo_y_facultad,
-    aplicar_filtros,
-)
-
 st.header("🔍 Filtros")
 col1, col2, col3 = st.columns(3)
 
@@ -346,7 +480,7 @@ with col3:
         key="carrera_seleccionada_riesgos",
     )
 
-# --- Aplicar filtros (igual que en Familias / Deudas) ---
+# --- Aplicar filtros base (grupo/facultad/carrera) ---
 datos_filtrados = aplicar_filtros(
     df_vulnerabilidad, grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
 )
@@ -361,9 +495,68 @@ if periodos:
     periodo = periodos[0]  # primer periodo disponible
     st.write(f"### {periodo}")
 
-    # Calcular vulnerabilidad
+    # ====== NUEVOS 3 FILTROS (solo Enrollment) ======
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        cant_papas_opt = st.selectbox(
+            "Cantidad de papás en el hogar",
+            options=["Todos", 0, 1, 2],
+            index=0,
+            help="Número de representantes (0 = sin padres registrados).",
+            key="cant_papas_riesgos",
+        )
+        cant_papas = None if cant_papas_opt == "Todos" else int(cant_papas_opt)
+
+    with c2:
+        cant_papas_trab_opt = st.selectbox(
+            "Cantidad de papás trabajando (JUN/2025)",
+            options=["Todos", 0, 1, 2],
+            index=0,
+            help="Se considera 'trabajando' si aparece en Ingresos 2025-06 con Relación de Dependencia o Afiliación Voluntaria.",
+            key="cant_papas_trab_riesgos",
+        )
+        cant_papas_trab = (
+            None if cant_papas_trab_opt == "Todos" else int(cant_papas_trab_opt)
+        )
+
+    with c3:
+        tipo_empleo_sel = st.selectbox(
+            "Tipo de empleo (JUN/2025)",
+            options=["Todos"] + EMPLEOS_TODOS,
+            index=0,
+            help="‘Desconocido’ = no aparece en Ingresos del mes 6/2025.",
+            key="tipo_empleo_riesgos",
+        )
+
+    # Filtrar SOLO el Universo por los 3 filtros (sin tocar la lógica de vulnerabilidad)
+    df_universo_filtrado = _filtrar_universo_enrollment(
+        datos_filtrados, periodo, cant_papas, cant_papas_trab, tipo_empleo_sel
+    )
+
+    # Copia superficial para no mutar 'datos_filtrados' original
+    datos_filtrados_f = dict(datos_filtrados)
+    datos_filtrados_f["Universo Familiares"] = df_universo_filtrado
+
+    # 🔧 NUEVO: si hay algún filtro activo (0/1/2 papás, 0/1/2 papás trabajando, o tipo de empleo específico),
+    # entonces limita también los estudiantes del PERIODO ACTIVO a quienes están en el universo filtrado.
+    aplican_filtros = (
+        (cant_papas in (0, 1, 2))
+        or (cant_papas_trab in (0, 1, 2))
+        or (tipo_empleo_sel is not None and tipo_empleo_sel != "Todos")
+    )
+
+    if aplican_filtros:
+        ids_ok = set(df_universo_filtrado["identificacion"].unique())
+        dfp = datos_filtrados_f["Personas"].copy()
+
+        # Mantener intactos otros periodos. En el periodo activo, conservar solo ids_ok
+        mask = (dfp["periodo"] != periodo) | (dfp["identificacion"].isin(ids_ok))
+        datos_filtrados_f["Personas"] = dfp[mask]
+
+    # Calcular vulnerabilidad (lógica original intacta)
     estudiantes_vulnerables = calcular_vulnerabilidad_estudiantes(
-        datos_filtrados, periodo
+        datos_filtrados_f, periodo
     )
 
     if not estudiantes_vulnerables.empty:

@@ -371,8 +371,8 @@ def crear_boxplot_salarios_hogares(datos_filtrados, periodo, grupo_seleccionado)
             y=salarios,
             name="Salarios por Hogar",
             boxpoints=False,
-            marker_color="lightgreen",
-            line_color="darkgreen",
+            marker_color="#0070C0",
+            line_color="#0070C0",
         )
     )
     grupo_nombre = "Afluentes" if grupo_seleccionado == "A" else "Enrollment"
@@ -877,15 +877,14 @@ def crear_diagrama_sankey(datos_filtrados, periodo, grupo_seleccionado):
     if not source:  # No hay transiciones para mostrar
         return None
 
-    # Colores para los nodos
-    colores_nodos = [
-        "#ff6b6b",
-        "#4ecdc4",
-        "#45b7d1",  # Marzo
-        "#ff6b6b",
-        "#4ecdc4",
-        "#45b7d1",  # Junio
-    ]
+    # paleta en el mismo tono con distintas opacidades
+    c_base = "rgba(0,112,192,1.0)"  # fuerte
+    c_mid = "rgba(0,112,192,0.70)"  # medio
+    c_light = "rgba(0,112,192,0.40)"  # suave
+
+    # Orden de tipos:
+    # tipos = ["Relacion de Dependencia", "Afiliacion Voluntaria", "Desconocido"]
+    colores_nodos = [c_base, c_mid, c_light, c_base, c_mid, c_light]  # Marzo  # Junio
 
     # Crear el diagrama de Sankey
     fig = go.Figure(
@@ -901,6 +900,7 @@ def crear_diagrama_sankey(datos_filtrados, periodo, grupo_seleccionado):
                 link=dict(
                     source=source, target=target, value=value, color="rgba(0,0,0,0.3)"
                 ),
+                textfont=dict(color="#111827", size=14),
             )
         ]
     )
@@ -912,6 +912,7 @@ def crear_diagrama_sankey(datos_filtrados, periodo, grupo_seleccionado):
         title=f"Transiciones de Tipo de Empleo - {grupo_nombre} {periodo} (Marzo → Junio)",
         font_size=12,
         height=500,
+        hoverlabel=dict(bgcolor="white", font_size=12, font_color="#111827"),
     )
 
     return fig
@@ -1382,8 +1383,8 @@ else:  # Enrollment (E)
                         y=salarios,
                         name="Salarios por Hogar",
                         boxpoints=False,
-                        marker_color="lightgreen",
-                        line_color="darkgreen",
+                        marker_color="#0070C0",
+                        line_color="#0070C0",
                     )
                 )
                 fig_hogar.update_layout(
@@ -1466,6 +1467,10 @@ else:  # Enrollment (E)
                     tgt.append(idx[f"{d} (Junio)"])
                     val.append(k)
 
+            c_base = "rgba(0,112,192,1.0)"  # fuerte  = #0070C0
+            c_mid = "rgba(0,112,192,0.70)"  # medio
+            c_light = "rgba(0,112,192,0.40)"  # suave
+
             if val:
                 fig_sankey = go.Figure(
                     data=[
@@ -1475,7 +1480,7 @@ else:  # Enrollment (E)
                                 thickness=20,
                                 line=dict(color="black", width=0.5),
                                 label=todos_nodos,
-                                color=["#ff6b6b", "#4ecdc4", "#45b7d1"] * 2,
+                                color=[c_base, c_mid, c_light, c_base, c_mid, c_light],
                             ),
                             link=dict(
                                 source=src,
@@ -1483,6 +1488,7 @@ else:  # Enrollment (E)
                                 value=val,
                                 color="rgba(0,0,0,0.3)",
                             ),
+                            textfont=dict(color="#111827", size=14),
                         )
                     ]
                 )

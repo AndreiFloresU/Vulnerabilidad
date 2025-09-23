@@ -9,9 +9,42 @@ from utils.filtros import (
 )
 from utils.tarjetas import tarjeta_simple, COLORES
 import numpy as np
+import re
+from typing import Tuple, List
 
 EMPLEOS_VALIDOS = ["Relacion de Dependencia", "Afiliacion Voluntaria"]
 EMPLEOS_TODOS = EMPLEOS_VALIDOS + ["Desconocido"]
+
+
+def _parse_rgba_str(rgba_str: str) -> Tuple[int, int, int, float]:
+    m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\)", rgba_str.strip())
+    if not m:
+        raise ValueError(f"RGBA inválido: {rgba_str}")
+    r, g, b, a = m.groups()
+    return int(r), int(g), int(b), float(a)
+
+
+def _mix_with_white(rgb: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    # t=0 => color base, t=1 => blanco
+    r0, g0, b0 = rgb
+    r = int(round(r0 * (1.0 - t) + 255 * t))
+    g = int(round(g0 * (1.0 - t) + 255 * t))
+    b = int(round(b0 * (1.0 - t) + 255 * t))
+    return (r, g, b)
+
+
+def generar_paleta_pastel(desde_rgba: str, n: int = 10) -> List[str]:
+    base_r, base_g, base_b, _ = _parse_rgba_str(desde_rgba)
+    base_rgb: Tuple[int, int, int] = (base_r, base_g, base_b)
+    ts = np.linspace(0.0, 0.82, n)  # 0 = más fuerte, 0.82 = muy pastel
+    colores: List[str] = []
+    for t in ts:
+        r, g, b = _mix_with_white(base_rgb, float(t))
+        colores.append(f"rgba({r},{g},{b},1.0)")
+    return colores
+
+
+PALETA_AZUL_PASTEL_10: List[str] = generar_paleta_pastel("rgba(0,112,192,1.0)", n=10)
 
 
 def _normalizar_ids_familia(df: pd.DataFrame) -> pd.DataFrame:
@@ -227,6 +260,9 @@ def crear_pie_chart_tipos_deuda(
     top_deudas = df_deudas_filtrado.groupby("tipo_final")["valor"].sum().reset_index()
     top_deudas = top_deudas.sort_values("valor", ascending=False).head(10)
 
+    # Calcula cuántas categorías vas a graficar
+    k = min(10, len(top_deudas))
+
     if top_deudas.empty:
         return None
 
@@ -236,7 +272,7 @@ def crear_pie_chart_tipos_deuda(
         values="valor",
         names="tipo_final",
         title=f"Top 10 Tipos de Deuda - {grupo_seleccionado} {periodo} (Julio 2025)",
-        color_discrete_sequence=px.colors.qualitative.Set3,
+        color_discrete_sequence=PALETA_AZUL_PASTEL_10[:k],
     )
 
     # Personalizar el gráfico
@@ -247,6 +283,7 @@ def crear_pie_chart_tipos_deuda(
         + "Valor: $%{value:,.0f}<br>"
         + "Porcentaje: %{percent}<br>"
         + "<extra></extra>",
+        marker=dict(line=dict(color="white", width=1)),
     )
 
     fig.update_layout(
@@ -344,10 +381,9 @@ def crear_bar_chart_calificacion_descriptiva(
 
     # Colores por categoría
     colores = {
-        "Riesgo estable": "#2ecc71",  # verde
-        "Riesgo moderado": "#f1c40f",  # amarillo
-        "Alto Riesgo": "#e74c3c",  # rojo
-        "Desconocido": "#95a5a6",  # gris
+        "Riesgo estable": "rgba(0,112,192,1.0)",  # verde
+        "Riesgo moderado": "rgba(0,112,192,0.70)",  # amarillo
+        "Alto Riesgo": "rgba(0,112,192,0.40)",  # rojo
     }
 
     fig = px.bar(
