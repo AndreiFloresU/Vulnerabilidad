@@ -10,6 +10,62 @@ from utils.filtros import (
 )
 from utils.tarjetas import tarjeta_simple, COLORES
 import numpy as np
+from utils.hogarUnico import make_hogar_id
+
+
+def _remove_outliers_iqr(
+    df: pd.DataFrame, cols: list[str], k: float = 1.5
+) -> pd.DataFrame:
+    """
+    Filtra outliers por IQR en las columnas indicadas.
+    Mantiene filas que estén dentro de [Q1 - k*IQR, Q3 + k*IQR] para *todas* las cols.
+    """
+    mask = pd.Series([True] * len(df), index=df.index)
+    for c in cols:
+        q1 = df[c].quantile(0.25)
+        q3 = df[c].quantile(0.75)
+        iqr = q3 - q1
+        low = q1 - k * iqr
+        high = q3 + k * iqr
+        mask &= df[c].between(low, high)
+    return df[mask]
+
+
+def contar_hogares_unicos(familias_df: pd.DataFrame) -> int:
+    """
+    Retorna el número de hogares únicos en el DataFrame.
+    Un hogar se define por la combinación (ced_padre, ced_madre).
+    """
+    if familias_df.empty:
+        return 0
+
+    hogar_ids = familias_df.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    hogar_ids = hogar_ids[hogar_ids != ""]
+    return hogar_ids.nunique()
+
+
+def mediana_salario_por_hogar(familias_df: pd.DataFrame) -> float:
+    """
+    Retorna la mediana del salario familiar considerando hogares únicos.
+    """
+    if familias_df.empty or "salario_familiar" not in familias_df.columns:
+        return 0.0
+
+    tmp = familias_df.copy()
+
+    tmp["hogar_id"] = tmp.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    tmp = tmp[tmp["hogar_id"] != ""]
+
+    # tomar un valor por hogar
+    salarios_hogares = tmp.groupby("hogar_id", as_index=False)[
+        "salario_familiar"
+    ].first()["salario_familiar"]
+
+    return float(salarios_hogares.median()) if not salarios_hogares.empty else 0.0
 
 
 def obtener_datos_familias(datos_filtrados, periodo, grupo_seleccionado):
@@ -130,8 +186,8 @@ def obtener_datos_salario_deuda_familia(datos_filtrados, familias_df):
     df_deudas = datos_filtrados.get("Deudas", pd.DataFrame())
 
     result_familias = familias_df.copy()
-    result_familias["salario_familiar"] = 0
-    result_familias["deuda_familiar"] = 0
+    result_familias["salario_familiar"] = 0.0
+    result_familias["deuda_familiar"] = 0.0
 
     if not df_ingresos.empty:
         # Filtrar por año 2025 mes 6
@@ -150,14 +206,14 @@ def obtener_datos_salario_deuda_familia(datos_filtrados, familias_df):
                     salario_padre = ingresos_mes6[
                         ingresos_mes6["identificacion"] == familia["ced_padre"]
                     ]["salario"].sum()
-                    salario_total += salario_padre
+                    salario_total += salario_padre * 14
 
                 # Salario de la madre
                 if familia["ced_madre"] != "0":
                     salario_madre = ingresos_mes6[
                         ingresos_mes6["identificacion"] == familia["ced_madre"]
                     ]["salario"].sum()
-                    salario_total += salario_madre
+                    salario_total += salario_madre * 14
 
                 result_familias.loc[idx, "salario_familiar"] = salario_total
 
@@ -286,26 +342,43 @@ def crear_donut_desempleo(familias_df, periodo, grupo_seleccionado):
 
 
 def crear_scatter_salario_deuda(familias_df, periodo, grupo_seleccionado):
-    """
-    Crea un scatter plot mostrando relación entre salario familiar y deuda familiar
-    """
     if familias_df.empty:
         return None
 
-    # Filtrar familias con datos válidos
-    familias_validas = familias_df[
-        (familias_df["salario_familiar"] > 0) | (familias_df["deuda_familiar"] > 0)
-    ].copy()
+    tmp = familias_df.copy()
 
-    if familias_validas.empty:
+    tmp["hogar_id"] = tmp.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    tmp = tmp[tmp["hogar_id"] != ""]
+
+    # tomar un registro por hogar
+    hogares = tmp.groupby("hogar_id", as_index=False)[
+        ["salario_familiar", "deuda_familiar"]
+    ].first()
+
+    hogares_validos = hogares[
+        (hogares["salario_familiar"].notna())
+        & (hogares["deuda_familiar"].notna())
+        & ((hogares["salario_familiar"] > 0) | (hogares["deuda_familiar"] > 0))
+    ]
+
+    if hogares_validos.empty:
         return None
 
-    # Crear scatter plot
+    # 🔹 quitar outliers por IQR (Tukey) en ambas variables
+    hogares_clean = _remove_outliers_iqr(
+        hogares_validos, ["salario_familiar", "deuda_familiar"], k=1.5
+    )
+
+    if hogares_clean.empty:
+        return None
+
     fig = px.scatter(
-        familias_validas,
+        hogares_clean,
         x="salario_familiar",
         y="deuda_familiar",
-        title=f"Relación Salario vs Deuda Familiar - {grupo_seleccionado} {periodo} (Junio 2025)",
+        title=f"Relación Salario vs Deuda Familiar - {grupo_seleccionado} {periodo}",
         labels={
             "salario_familiar": "Salario Familiar (USD)",
             "deuda_familiar": "Deuda Familiar (USD)",
@@ -314,10 +387,9 @@ def crear_scatter_salario_deuda(familias_df, periodo, grupo_seleccionado):
         color_discrete_sequence=["#1f77b4"],
     )
 
-    # Personalizar
     fig.update_traces(
         marker=dict(size=8),
-        hovertemplate="<b>Familia</b><br>"
+        hovertemplate="<b>Hogar</b><br>"
         + "Salario: $%{x:,.0f}<br>"
         + "Deuda: $%{y:,.0f}<extra></extra>",
     )
@@ -325,8 +397,33 @@ def crear_scatter_salario_deuda(familias_df, periodo, grupo_seleccionado):
     fig.update_layout(
         height=500, xaxis=dict(tickformat="$,.0f"), yaxis=dict(tickformat="$,.0f")
     )
-
     return fig
+
+
+def calcular_salario_promedio_por_hogar(familias_df: pd.DataFrame) -> float:
+    if familias_df.empty or "salario_familiar" not in familias_df.columns:
+        return 0.0
+
+    hogares = familias_df.copy()
+
+    # Asegura strings limpios; trata vacío como "0"
+    hogares["ced_padre"] = hogares["ced_padre"].str.strip().replace({"": "0"})
+    hogares["ced_madre"] = hogares["ced_madre"].str.strip().replace({"": "0"})
+
+    # ID estable de hogar sin usar apply (más rápido)
+    hogares["hogar_id"] = hogares.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    hogares = hogares[hogares["hogar_id"] != ""]
+
+    # Un solo registro por hogar y promedio del salario familiar
+    salario_promedio_hogar = (
+        hogares.groupby("hogar_id", as_index=False)["salario_familiar"]
+        .first()["salario_familiar"]
+        .mean()
+    )
+
+    return float(salario_promedio_hogar) if pd.notnull(salario_promedio_hogar) else 0.0
 
 
 # Configuración de la página
@@ -429,31 +526,28 @@ else:
                     )
 
                     # Mostrar métricas para primer periodo
-                    subcol1, subcol2 = st.columns(2)
+                    subcol1, subcol2, subcol3 = st.columns(3)
                     with subcol1:
+                        num_hogares = contar_hogares_unicos(familias_df)
                         tarjeta_simple(
-                            "Total Familias", f"{len(familias_df)}", COLORES["azul"]
+                            "Total Familias", f"{num_hogares:,}", COLORES["azul"]
                         )
                     with subcol2:
-                        salario_promedio = familias_df["salario_familiar"].mean()
+                        salario_promedio = calcular_salario_promedio_por_hogar(
+                            familias_df
+                        )
                         tarjeta_simple(
-                            "Salario Promedio",
+                            "Ingreso Promedio Anual",
                             f"${salario_promedio:,.0f}",
                             COLORES["morado"],
                         )
-
-                    # Gráficos de desempleo
-                    fig_tree = crear_treemap_desempleo(
-                        familias_df, periodos[0], grupo_seleccionado
-                    )
-                    if fig_tree:
-                        st.plotly_chart(fig_tree, use_container_width=True)
-
-                    fig_donut = crear_donut_desempleo(
-                        familias_df, periodos[0], grupo_seleccionado
-                    )
-                    if fig_donut:
-                        st.plotly_chart(fig_donut, use_container_width=True)
+                    with subcol3:
+                        mediana_salario = mediana_salario_por_hogar(familias_df)
+                        tarjeta_simple(
+                            "Ingreso Anual - Mediano",
+                            f"${mediana_salario:,.0f}",
+                            COLORES["verde"],
+                        )
 
                 else:
                     st.info("No hay datos de familias disponibles para este periodo")
@@ -490,31 +584,28 @@ else:
                     )
 
                     # Mostrar métricas para segundo periodo
-                    subcol1, subcol2 = st.columns(2)
+                    subcol1, subcol2, subcol3 = st.columns(3)
                     with subcol1:
+                        num_hogares2 = contar_hogares_unicos(familias_df2)
                         tarjeta_simple(
-                            "Total Familias", f"{len(familias_df2)}", COLORES["azul"]
+                            "Total Familias", f"{num_hogares2:,}", COLORES["azul"]
                         )
                     with subcol2:
-                        salario_promedio2 = familias_df2["salario_familiar"].mean()
+                        salario_promedio2 = calcular_salario_promedio_por_hogar(
+                            familias_df2
+                        )
                         tarjeta_simple(
-                            "Salario Promedio",
+                            "Ingreso Promedio Anual",
                             f"${salario_promedio2:,.0f}",
                             COLORES["morado"],
                         )
-
-                    # Gráficos de desempleo
-                    fig_tree2 = crear_treemap_desempleo(
-                        familias_df2, periodos[1], grupo_seleccionado
-                    )
-                    if fig_tree2:
-                        st.plotly_chart(fig_tree2, use_container_width=True)
-
-                    fig_donut2 = crear_donut_desempleo(
-                        familias_df2, periodos[1], grupo_seleccionado
-                    )
-                    if fig_donut2:
-                        st.plotly_chart(fig_donut2, use_container_width=True)
+                    with subcol3:
+                        mediana_salario2 = mediana_salario_por_hogar(familias_df2)
+                        tarjeta_simple(
+                            "Ingreso Anual - Mediano",
+                            f"${mediana_salario2:,.0f}",
+                            COLORES["verde"],
+                        )
 
                 else:
                     st.info("No hay datos de familias disponibles para este periodo")
@@ -586,55 +677,29 @@ else:
                 )
 
                 # Mostrar métricas generales
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3 = st.columns(3)
 
                 with col1:
+                    num_hogares = contar_hogares_unicos(familias_df)
                     tarjeta_simple(
-                        "Total Familias", f"{len(familias_df)}", COLORES["azul"]
+                        "Total Familias", f"{num_hogares:,}", COLORES["azul"]
                     )
 
                 with col2:
-                    familias_con_padre = len(
-                        familias_df[familias_df["ced_padre"] != "0"]
-                    )
+                    salario_promedio = calcular_salario_promedio_por_hogar(familias_df)
                     tarjeta_simple(
-                        "Con Padre", f"{familias_con_padre}", COLORES["verde"]
-                    )
-
-                with col3:
-                    familias_con_madre = len(
-                        familias_df[familias_df["ced_madre"] != "0"]
-                    )
-                    tarjeta_simple(
-                        "Con Madre", f"{familias_con_madre}", COLORES["naranja"]
-                    )
-
-                with col4:
-                    salario_promedio = familias_df["salario_familiar"].mean()
-                    tarjeta_simple(
-                        "Salario Promedio",
+                        "Ingreso Promedio Anual",
                         f"${salario_promedio:,.0f}",
                         COLORES["morado"],
                     )
 
-                st.markdown("---")
-
-                # Gráficos de desempleo
-                col_tree, col_donut = st.columns(2)
-
-                with col_tree:
-                    fig_tree = crear_treemap_desempleo(
-                        familias_df, periodo, grupo_seleccionado
+                with col3:
+                    mediana_salario = mediana_salario_por_hogar(familias_df)
+                    tarjeta_simple(
+                        "Ingreso Anual - Mediano",
+                        f"${mediana_salario:,.0f}",
+                        COLORES["verde"],
                     )
-                    if fig_tree:
-                        st.plotly_chart(fig_tree, use_container_width=True)
-
-                with col_donut:
-                    fig_donut = crear_donut_desempleo(
-                        familias_df, periodo, grupo_seleccionado
-                    )
-                    if fig_donut:
-                        st.plotly_chart(fig_donut, use_container_width=True)
 
                 # Scatter plot de salario vs deuda
                 st.markdown("---")

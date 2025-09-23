@@ -9,6 +9,158 @@ from utils.filtros import (
     mostrar_filtros_en_pagina,
 )
 from utils.tarjetas import tarjeta_simple, COLORES
+from utils.hogarUnico import make_hogar_id
+
+
+# --- Helpers para rangos de quintil en tarjetas ---
+def _fmt_money(v: float) -> str:
+    if v is None:
+        return "-"
+    try:
+        return f"${v:,.2f}"
+    except Exception:
+        return str(v)
+
+
+# Rangos de referencia JUN/2025 a nivel de HOGAR (suma papá+mamá)
+RANGOS_QUINTILES_HOGAR = [
+    {"Quintil": 1, "Salario_Min": 1.13, "Salario_Max": 642.03},
+    {"Quintil": 2, "Salario_Min": 642.03, "Salario_Max": 909.08},
+    {"Quintil": 3, "Salario_Min": 909.08, "Salario_Max": 1415.91},
+    {"Quintil": 4, "Salario_Min": 1415.91, "Salario_Max": 2491.60},
+    {"Quintil": 5, "Salario_Min": 2491.60, "Salario_Max": 20009.99},
+]
+
+
+def rangos_quintiles_hogar_dict() -> dict:
+    """
+    Devuelve: {"Quintil 1": "$1.13 – $642.03", ...}
+    """
+    d = {}
+    for q in RANGOS_QUINTILES_HOGAR:
+        k = f"Quintil {q['Quintil']}"
+        d[k] = f"{_fmt_money(q['Salario_Min'])} – {_fmt_money(q['Salario_Max'])}"
+    return d
+
+
+def filtrar_outliers_iqr(
+    serie: pd.Series, k: float = 1.5, min_obs: int = 20
+) -> pd.Series:
+    """
+    Filtra outliers por Tukey (k * IQR).
+    - k: 1.5 estándar; usa 3 si quieres ser menos agresivo.
+    - min_obs: si hay pocos datos, no filtra.
+    """
+    s = pd.to_numeric(serie, errors="coerce").dropna()
+    if s.size < min_obs:
+        return s
+    q1 = s.quantile(0.25)
+    q3 = s.quantile(0.75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return s
+    low = q1 - k * iqr
+    high = q3 + k * iqr
+    return s[(s >= low) & (s <= high)]
+
+
+def crear_boxplot_salarios_hogares(datos_filtrados, periodo, grupo_seleccionado):
+    """
+    Crea un boxplot de salarios a nivel de hogar (1 registro por hogar único).
+    Si hay hermanos, se considera un único hogar.
+    Para el ingreso del hogar se suma el salario del padre y de la madre (si existen).
+    """
+
+    if grupo_seleccionado not in ["A", "E"]:
+        return None
+
+    # Estudiantes del periodo
+    df_personas = datos_filtrados["Personas"]
+    estudiantes_periodo = df_personas[df_personas["periodo"] == periodo][
+        "identificacion"
+    ].drop_duplicates()
+
+    # Universo de familiares
+    df_universo = datos_filtrados.get("Universo Familiares", pd.DataFrame())
+    if df_universo.empty:
+        return None
+
+    # Filtrar universo por estudiantes del periodo
+    universo_periodo = df_universo[
+        df_universo["identificacion"].isin(estudiantes_periodo)
+    ].copy()
+
+    # Normalizar y crear hogar_id único (independiente del orden padre/madre)
+    universo_periodo["ced_padre"] = (
+        universo_periodo["ced_padre"].astype(str).str.strip().replace({"": "0"})
+    )
+    universo_periodo["ced_madre"] = (
+        universo_periodo["ced_madre"].astype(str).str.strip().replace({"": "0"})
+    )
+    universo_periodo["hogar_id"] = universo_periodo.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    # Quedarse con hogares válidos
+    universo_periodo = universo_periodo[universo_periodo["hogar_id"] != ""]
+    if universo_periodo.empty:
+        return None
+
+    # Traer ingresos (mes 6)
+    df_ingresos = datos_filtrados.get("Ingresos", pd.DataFrame())
+    if df_ingresos.empty:
+        return None
+    df_ingresos_mes6 = df_ingresos[
+        (df_ingresos["anio"] == 2025) & (df_ingresos["mes"] == 6)
+    ]
+
+    # Mapear hogar_id -> integrantes (padre/madre) y unir con ingresos
+    pares = []
+    for _, r in universo_periodo.iterrows():
+        if r["ced_padre"] != "0":
+            pares.append((r["hogar_id"], r["ced_padre"]))
+        if r["ced_madre"] != "0":
+            pares.append((r["hogar_id"], r["ced_madre"]))
+    df_mapa = pd.DataFrame(pares, columns=["hogar_id", "fam_id"]).drop_duplicates()
+    if df_mapa.empty:
+        return None
+
+    df_merge = df_mapa.merge(
+        df_ingresos_mes6[["identificacion", "salario"]],
+        left_on="fam_id",
+        right_on="identificacion",
+        how="left",
+    )
+
+    # Salario del hogar = suma de salarios de sus integrantes (papá+mamá si aplica)
+    df_hogar_salario = df_merge.groupby("hogar_id", as_index=False)["salario"].sum()
+    salarios = df_hogar_salario["salario"].dropna()
+
+    # 🔹 quitar outliers automáticamente (Tukey 1.5×IQR)
+    salarios = filtrar_outliers_iqr(salarios, k=1.5)
+
+    if salarios.empty:
+        return None
+
+    # Boxplot
+    fig = go.Figure()
+    fig.add_trace(
+        go.Box(
+            y=salarios,
+            name="Salarios por Hogar",
+            boxpoints=False,
+            marker_color="lightgreen",
+            line_color="darkgreen",
+        )
+    )
+    grupo_nombre = "Afluentes" if grupo_seleccionado == "A" else "Enrollment"
+    fig.update_layout(
+        title=f"Distribución de Salarios por Hogar - Familiares {grupo_nombre} {periodo}",
+        yaxis_title="Salario (USD)",
+        height=400,
+        showlegend=False,
+        yaxis=dict(tickformat="$,.0f"),
+    )
+    return fig
 
 
 def calcular_empleo_graduados(datos_filtrados, periodo):
@@ -54,88 +206,90 @@ def calcular_empleo_graduados(datos_filtrados, periodo):
 
 def calcular_empleo_familiares(datos_filtrados, periodo):
     """
-    Calcula empleados activos y desempleados para familiares (afluentes/enrollment) en un periodo específico
-
-    Args:
-        datos_filtrados: Diccionario con los datos filtrados
-        periodo: Periodo específico a analizar
+    Calcula empleados activos y desempleados para familiares (A/E) y métricas por hogar único.
 
     Returns:
         tuple: (activos, desempleados, total_hogares, hogares_con_trabajo)
+            - activos/desempleados: personas familiares únicas (padres/madres)
+            - total_hogares: hogares únicos reales (combinación padre|madre)
+            - hogares_con_trabajo: hogares con ≥1 familiar activo
     """
-    # Obtener estudiantes del periodo específico
+    # 1) Estudiantes del periodo
     df_personas = datos_filtrados["Personas"]
     estudiantes_periodo = df_personas[df_personas["periodo"] == periodo][
         "identificacion"
     ].drop_duplicates()
 
-    # Obtener universo de familiares
+    # 2) Universo de familiares
     df_universo = datos_filtrados.get("Universo Familiares", pd.DataFrame())
-
     if df_universo.empty:
         return 0, 0, 0, 0
 
-    # Filtrar universo por estudiantes del periodo
     universo_periodo = df_universo[
         df_universo["identificacion"].isin(estudiantes_periodo)
-    ]
+    ].copy()
 
-    # Calcular Total Hogares (estudiantes que tienen al menos un pariente)
-    hogares_con_familiares = universo_periodo[
+    # Normalizar IDs (string) y filtrar filas con al menos un familiar válido
+    universo_periodo["ced_padre"] = (
+        universo_periodo["ced_padre"].astype(str).str.strip().replace({"": "0"})
+    )
+    universo_periodo["ced_madre"] = (
+        universo_periodo["ced_madre"].astype(str).str.strip().replace({"": "0"})
+    )
+    u_valid = universo_periodo[
         (universo_periodo["ced_padre"] != "0") | (universo_periodo["ced_madre"] != "0")
-    ]
-    total_hogares = len(hogares_con_familiares["identificacion"].drop_duplicates())
+    ].copy()
 
-    # Obtener cédulas únicas de padres y madres (excluyendo los 0)
-    cedulas_padres = universo_periodo["ced_padre"][
-        universo_periodo["ced_padre"] != "0"
-    ].drop_duplicates()
-    cedulas_madres = universo_periodo["ced_madre"][
-        universo_periodo["ced_madre"] != "0"
-    ].drop_duplicates()
+    # 3) Construir hogar_id único (independiente del orden padre/madre)
+    u_valid["hogar_id"] = u_valid.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    u_valid = u_valid[u_valid["hogar_id"] != ""]
 
-    # Combinar cédulas de padres y madres y obtener únicos
+    # Total de hogares únicos reales
+    total_hogares = u_valid["hogar_id"].nunique()
+
+    # 4) Familiares (personas) únicos del periodo (padres + madres)
+    cedulas_padres = u_valid.loc[
+        u_valid["ced_padre"] != "0", "ced_padre"
+    ].drop_duplicates()
+    cedulas_madres = u_valid.loc[
+        u_valid["ced_madre"] != "0", "ced_madre"
+    ].drop_duplicates()
     familiares_unicos = pd.concat([cedulas_padres, cedulas_madres]).drop_duplicates()
     total_familiares = len(familiares_unicos)
 
-    # Obtener datos de ingresos unificados
+    # 5) Ingresos (mes 6 de 2025) para empleo actual
     df_ingresos = datos_filtrados.get("Ingresos", pd.DataFrame())
-
     if df_ingresos.empty:
+        # Sin ingresos: nadie activo, hogares_con_trabajo=0
         return 0, total_familiares, total_hogares, 0
 
-    # Filtrar por año 2025 y mes 6 (el último mes para determinar empleo actual)
     df_ingresos_mes6 = df_ingresos[
         (df_ingresos["anio"] == 2025) & (df_ingresos["mes"] == 6)
     ]
 
-    # Obtener identificaciones únicas de familiares que trabajan en mes 6
-    familiares_activos = df_ingresos_mes6["identificacion"].drop_duplicates()
-
-    # Filtrar solo los familiares que pertenecen al periodo específico
-    activos_en_periodo = familiares_activos[familiares_activos.isin(familiares_unicos)]
-
+    # Personas familiares activas (únicas) en mes 6 que pertenecen al periodo
+    familiares_activos_mes6 = df_ingresos_mes6["identificacion"].drop_duplicates()
+    activos_en_periodo = familiares_activos_mes6[
+        familiares_activos_mes6.isin(familiares_unicos)
+    ]
     activos = len(activos_en_periodo)
     desempleados = total_familiares - activos
 
-    # Calcular Hogares con Trabajo (estudiantes donde al menos un familiar trabaja)
-    # Obtener identificaciones de estudiantes cuyos familiares trabajan
-    df_ingresos_estudiantes = df_ingresos_mes6[
-        df_ingresos_mes6["identificacion"].isin(familiares_unicos)
-    ]
+    # 6) Hogares con trabajo (≥1 familiar activo) — por hogar único
+    # Mapa hogar_id -> fam_id (padre/madre)
+    mapa = []
+    for _, r in u_valid.iterrows():
+        if r["ced_padre"] != "0":
+            mapa.append((r["hogar_id"], r["ced_padre"]))
+        if r["ced_madre"] != "0":
+            mapa.append((r["hogar_id"], r["ced_madre"]))
+    df_mapa = pd.DataFrame(mapa, columns=["hogar_id", "fam_id"]).drop_duplicates()
 
-    # Para cada estudiante, verificar si al menos un familiar trabaja
-    estudiantes_con_trabajo = set()
-    for _, row in df_ingresos_estudiantes.iterrows():
-        # Buscar el estudiante que corresponde a este familiar
-        estudiante_row = universo_periodo[
-            (universo_periodo["ced_padre"] == row["identificacion"])
-            | (universo_periodo["ced_madre"] == row["identificacion"])
-        ]
-        if not estudiante_row.empty:
-            estudiantes_con_trabajo.update(estudiante_row["identificacion"].tolist())
-
-    hogares_con_trabajo = len(estudiantes_con_trabajo)
+    hogares_con_trabajo = df_mapa[df_mapa["fam_id"].isin(set(activos_en_periodo))][
+        "hogar_id"
+    ].nunique()
 
     return activos, desempleados, total_hogares, hogares_con_trabajo
 
@@ -173,6 +327,9 @@ def crear_boxplot_salarios(datos_filtrados, periodo, grupo_seleccionado):
 
         salarios = df_ingresos_mes6["salario"].dropna()
         titulo = f"Distribución de Salarios - Graduados {periodo}"
+
+        # 🔹 quitar outliers automáticamente
+        salarios = filtrar_outliers_iqr(salarios, k=1.5)
 
     else:  # Afluentes o Enrollment
         # Obtener estudiantes del periodo
@@ -218,6 +375,9 @@ def crear_boxplot_salarios(datos_filtrados, periodo, grupo_seleccionado):
         grupo_nombre = "Afluentes" if grupo_seleccionado == "A" else "Enrollment"
         titulo = f"Distribución de Salarios - Familiares {grupo_nombre} {periodo}"
 
+        # 🔹 quitar outliers automáticamente
+        salarios = filtrar_outliers_iqr(salarios, k=1.5)
+
     if len(salarios) == 0:
         return None
 
@@ -227,7 +387,7 @@ def crear_boxplot_salarios(datos_filtrados, periodo, grupo_seleccionado):
         go.Box(
             y=salarios,
             name="Salarios",
-            boxpoints="outliers",
+            boxpoints=False,
             marker_color="lightblue",
             line_color="darkblue",
         )
@@ -337,20 +497,21 @@ def calcular_quintiles(datos_filtrados, periodo, grupo_seleccionado):
     return quintiles_dict
 
 
-def mostrar_tarjetas_quintiles(quintiles_dict):
+def mostrar_tarjetas_quintiles(quintiles_dict, rangos_dict: dict | None = None):
     """
-    Muestra las 5 tarjetas de quintiles con diferentes colores
+    Muestra las 5 tarjetas de quintiles con porcentajes y (opcional) el rango
+    bajo cada tarjeta en tipografía pequeña.
 
     Args:
-        quintiles_dict: Diccionario con porcentajes por quintil
+        quintiles_dict: {"Quintil 1": 20.0, ...}
+        rangos_dict:    {"Quintil 1": "$1.13 – $642.03", ...}  (opcional)
     """
-    # Colores para cada quintil
     colores_quintiles = [
-        COLORES["rojo"],  # Quintil 1 - Más bajo
-        COLORES["naranja"],  # Quintil 2
-        COLORES["amarillo"],  # Quintil 3 - Medio
-        COLORES["cyan"],  # Quintil 4
-        COLORES["verde"],  # Quintil 5 - Más alto
+        COLORES["rojo"],  # Q1
+        COLORES["naranja"],  # Q2
+        COLORES["amarillo"],  # Q3
+        COLORES["cyan"],  # Q4
+        COLORES["verde"],  # Q5
     ]
 
     st.write("**📊 Distribución por Quintiles de Ingresos**")
@@ -359,15 +520,29 @@ def mostrar_tarjetas_quintiles(quintiles_dict):
         st.info("No hay datos de quintiles disponibles para este periodo")
         return
 
-    # Crear 5 columnas para los quintiles
     cols = st.columns(5)
 
     for i in range(5):
-        quintil_key = f"Quintil {i+1}"
-        percentage = quintiles_dict.get(quintil_key, 0)
-
+        qkey = f"Quintil {i+1}"
+        percentage = quintiles_dict.get(qkey, 0)
         with cols[i]:
-            tarjeta_simple(quintil_key, f"{percentage:.1f}%", colores_quintiles[i])
+            # Tarjeta principal (título + %)
+            tarjeta_simple(qkey, f"{percentage:.1f}%", colores_quintiles[i])
+
+            # Rango en texto pequeño (si viene)
+            if rangos_dict and qkey in rangos_dict:
+                st.markdown(
+                    f"""
+                    <div style="
+                        margin-top: 0px;
+                        font-size: 0.78rem;
+                        color: #6b7280;
+                        text-align:center;">
+                        {rangos_dict[qkey]}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 
 def crear_diagrama_sankey(datos_filtrados, periodo, grupo_seleccionado):
@@ -519,6 +694,98 @@ def crear_diagrama_sankey(datos_filtrados, periodo, grupo_seleccionado):
     return fig
 
 
+def calcular_quintiles_hogares(datos_filtrados, periodo, grupo_seleccionado):
+    """
+    Asigna a cada hogar un quintil según su salario total (Junio 2025).
+    Usa hogar_id único a partir de (ced_padre, ced_madre) para evitar duplicados por hermanos.
+    """
+    if grupo_seleccionado not in ["A", "E"]:
+        return {}
+
+    # 1) Rangos de quintiles (ojo a los gaps: ajusté límites para que sean contiguos)
+    quintiles_ref = [
+        {"Quintil": 1, "Salario_Min": 1.13, "Salario_Max": 642.03},
+        {"Quintil": 2, "Salario_Min": 642.03, "Salario_Max": 909.08},
+        {"Quintil": 3, "Salario_Min": 909.08, "Salario_Max": 1415.91},
+        {"Quintil": 4, "Salario_Min": 1415.91, "Salario_Max": 2491.60},
+        {"Quintil": 5, "Salario_Min": 2491.60, "Salario_Max": 20009.99},
+    ]
+
+    # 2) Estudiantes del periodo
+    df_personas = datos_filtrados["Personas"]
+    estudiantes_periodo = df_personas.loc[
+        df_personas["periodo"] == periodo, "identificacion"
+    ].drop_duplicates()
+
+    # 3) Universo de familiares (solo estudiantes del periodo)
+    df_univ = datos_filtrados.get("Universo Familiares", pd.DataFrame())
+    if df_univ.empty:
+        return {}
+
+    u = df_univ[df_univ["identificacion"].isin(estudiantes_periodo)].copy()
+    u["ced_padre"] = (
+        u["ced_padre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+    u["ced_madre"] = (
+        u["ced_madre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+
+    # 4) hogar_id único (independiente del orden padre/madre)
+    u["hogar_id"] = u.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    u = u[u["hogar_id"] != ""].copy()
+    if u.empty:
+        return {}
+
+    # 5) Mapa hogar_id -> familiares (padre/madre) sin “0”
+    pares = []
+    for _, r in u.iterrows():
+        if r["ced_padre"] != "0":
+            pares.append((r["hogar_id"], r["ced_padre"]))
+        if r["ced_madre"] != "0":
+            pares.append((r["hogar_id"], r["ced_madre"]))
+    df_mapa = pd.DataFrame(pares, columns=["hogar_id", "fam_id"]).drop_duplicates()
+    if df_mapa.empty:
+        return {}
+
+    # 6) Ingresos junio/2025
+    df_ing = datos_filtrados.get("Ingresos", pd.DataFrame())
+    if df_ing.empty:
+        return {}
+    df_ing_6 = df_ing[(df_ing["anio"] == 2025) & (df_ing["mes"] == 6)][
+        ["identificacion", "salario"]
+    ].copy()
+    # asegurar numérico
+    df_ing_6["salario"] = pd.to_numeric(df_ing_6["salario"], errors="coerce")
+
+    # 7) Salario del hogar = suma (papá + mamá)
+    df_merge = df_mapa.merge(
+        df_ing_6, left_on="fam_id", right_on="identificacion", how="left"
+    )
+    df_hogar_sal = df_merge.groupby("hogar_id", as_index=False)["salario"].sum()
+    df_hogar_sal = df_hogar_sal.dropna(subset=["salario"])  # type: ignore
+    if df_hogar_sal.empty:
+        return {}
+
+    # 8) Asignar quintil según rangos
+    def asignar_quintil(s):
+        for q in quintiles_ref:
+            if q["Salario_Min"] <= s <= q["Salario_Max"]:
+                return q["Quintil"]
+        return None
+
+    df_hogar_sal["quintil"] = df_hogar_sal["salario"].apply(asignar_quintil)
+
+    # 9) Distribución (%)
+    counts = df_hogar_sal["quintil"].value_counts().sort_index()
+    total = counts.sum()
+    return {
+        f"Quintil {i}": (counts.get(i, 0) / total * 100 if total else 0)
+        for i in range(1, 6)
+    }
+
+
 # Configuración de la página
 st.set_page_config(page_title="Empleos e Ingresos", page_icon="💼", layout="wide")
 
@@ -586,7 +853,9 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 quintiles = calcular_quintiles(
                     datos_filtrados, periodos[0], grupo_seleccionado
                 )
-                mostrar_tarjetas_quintiles(quintiles)
+                mostrar_tarjetas_quintiles(
+                    quintiles, rangos_dict=rangos_quintiles_hogar_dict()
+                )
 
                 # Agregar diagrama de Sankey para primera columna de Graduados
                 st.markdown("---")
@@ -609,10 +878,12 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 # Mostrar tarjetas de familiares
                 col_activos, col_desempleados = st.columns(2)
                 with col_activos:
-                    tarjeta_simple("Familiares Activos", activos, COLORES["verde"])
+                    tarjeta_simple(
+                        "Empleo Formal - Familiares", activos, COLORES["verde"]
+                    )
                 with col_desempleados:
                     tarjeta_simple(
-                        "Familiares Desempleados", desempleados, COLORES["rojo"]
+                        "Sin Empleo Formal - Familiares", desempleados, COLORES["rojo"]
                     )
 
                 # Separador
@@ -624,26 +895,30 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                     tarjeta_simple("Total Hogares", total_hogares, COLORES["azul"])
                 with col_hogares_trabajo:
                     tarjeta_simple(
-                        "Hogares con Trabajo", hogares_con_trabajo, COLORES["cyan"]
+                        "Hogares con Trabajo", hogares_con_trabajo, COLORES["amarillo"]
                     )
 
-                # Agregar boxplot de salarios
+                # Boxplot por hogar
                 st.markdown("---")
-                st.write("**💰 Distribución de Salarios Familiares**")
-                fig = crear_boxplot_salarios(
+                st.write("**🏠 Distribución de Salarios Familiares (por hogar)**")
+                fig_hogar = crear_boxplot_salarios_hogares(
                     datos_filtrados, periodos[0], grupo_seleccionado
                 )
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                if fig_hogar:
+                    st.plotly_chart(fig_hogar, use_container_width=True)
                 else:
-                    st.info("No hay datos de salarios disponibles para este periodo")
+                    st.info(
+                        "No hay datos de salarios por hogar disponibles para este periodo"
+                    )
 
                 # Agregar tarjetas de quintiles
                 st.markdown("---")
-                quintiles = calcular_quintiles(
+                quintiles = calcular_quintiles_hogares(
                     datos_filtrados, periodos[0], grupo_seleccionado
                 )
-                mostrar_tarjetas_quintiles(quintiles)
+                mostrar_tarjetas_quintiles(
+                    quintiles, rangos_dict=rangos_quintiles_hogar_dict()
+                )
 
                 # Agregar diagrama de Sankey para primera columna de Afluentes
                 st.markdown("---")
@@ -703,7 +978,9 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 quintiles = calcular_quintiles(
                     datos_filtrados, periodos[1], grupo_seleccionado
                 )
-                mostrar_tarjetas_quintiles(quintiles)
+                mostrar_tarjetas_quintiles(
+                    quintiles, rangos_dict=rangos_quintiles_hogar_dict()
+                )
 
                 # Agregar diagrama de Sankey para segunda columna de Graduados
                 st.markdown("---")
@@ -726,10 +1003,12 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                 # Mostrar tarjetas de familiares
                 col_activos, col_desempleados = st.columns(2)
                 with col_activos:
-                    tarjeta_simple("Familiares Activos", activos, COLORES["verde"])
+                    tarjeta_simple(
+                        "Empleo Formal - Familiares", activos, COLORES["verde"]
+                    )
                 with col_desempleados:
                     tarjeta_simple(
-                        "Familiares Desempleados", desempleados, COLORES["rojo"]
+                        "Sin Empleo Formal - Familiares", desempleados, COLORES["rojo"]
                     )
 
                 # Separador
@@ -741,26 +1020,30 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
                     tarjeta_simple("Total Hogares", total_hogares, COLORES["azul"])
                 with col_hogares_trabajo:
                     tarjeta_simple(
-                        "Hogares con Trabajo", hogares_con_trabajo, COLORES["cyan"]
+                        "Hogares con Trabajo", hogares_con_trabajo, COLORES["amarillo"]
                     )
 
-                # Agregar boxplot de salarios
+                # Boxplot por hogar
                 st.markdown("---")
-                st.write("**💰 Distribución de Salarios Familiares**")
-                fig = crear_boxplot_salarios(
+                st.write("**🏠 Distribución de Salarios Familiares (por hogar)**")
+                fig_hogar = crear_boxplot_salarios_hogares(
                     datos_filtrados, periodos[1], grupo_seleccionado
                 )
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                if fig_hogar:
+                    st.plotly_chart(fig_hogar, use_container_width=True)
                 else:
-                    st.info("No hay datos de salarios disponibles para este periodo")
+                    st.info(
+                        "No hay datos de salarios por hogar disponibles para este periodo"
+                    )
 
                 # Agregar tarjetas de quintiles
                 st.markdown("---")
-                quintiles = calcular_quintiles(
+                quintiles = calcular_quintiles_hogares(
                     datos_filtrados, periodos[1], grupo_seleccionado
                 )
-                mostrar_tarjetas_quintiles(quintiles)
+                mostrar_tarjetas_quintiles(
+                    quintiles, rangos_dict=rangos_quintiles_hogar_dict()
+                )
 
                 # Agregar diagrama de Sankey para segunda columna de Afluentes
                 st.markdown("---")
@@ -797,9 +1080,11 @@ else:  # Enrollment (E)
         # Mostrar tarjetas de familiares
         col_activos, col_desempleados = st.columns(2)
         with col_activos:
-            tarjeta_simple("Familiares Activos", activos, COLORES["verde"])
+            tarjeta_simple("Empleo Formal - Familiares", activos, COLORES["verde"])
         with col_desempleados:
-            tarjeta_simple("Familiares Desempleados", desempleados, COLORES["rojo"])
+            tarjeta_simple(
+                "Sin Empleo Formal - Familiares", desempleados, COLORES["rojo"]
+            )
 
         # Separador
         st.markdown("---")
@@ -809,21 +1094,27 @@ else:  # Enrollment (E)
         with col_total_hogares:
             tarjeta_simple("Total Hogares", total_hogares, COLORES["azul"])
         with col_hogares_trabajo:
-            tarjeta_simple("Hogares con Trabajo", hogares_con_trabajo, COLORES["cyan"])
+            tarjeta_simple(
+                "Hogares con Trabajo", hogares_con_trabajo, COLORES["amarillo"]
+            )
 
-        # Agregar boxplot de salarios
+        # Boxplot por hogar
         st.markdown("---")
-        st.write("**💰 Distribución de Salarios Familiares**")
-        fig = crear_boxplot_salarios(datos_filtrados, periodos[0], grupo_seleccionado)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
+        st.write("**🏠 Distribución de Salarios Familiares (por hogar)**")
+        fig_hogar = crear_boxplot_salarios_hogares(
+            datos_filtrados, periodos[0], grupo_seleccionado
+        )
+        if fig_hogar:
+            st.plotly_chart(fig_hogar, use_container_width=True)
         else:
-            st.info("No hay datos de salarios disponibles para este periodo")
+            st.info("No hay datos de salarios por hogar disponibles para este periodo")
 
         # Agregar tarjetas de quintiles
         st.markdown("---")
-        quintiles = calcular_quintiles(datos_filtrados, periodos[0], grupo_seleccionado)
-        mostrar_tarjetas_quintiles(quintiles)
+        quintiles = calcular_quintiles_hogares(
+            datos_filtrados, periodos[0], grupo_seleccionado
+        )
+        mostrar_tarjetas_quintiles(quintiles, rangos_dict=rangos_quintiles_hogar_dict())
 
         # Agregar diagrama de Sankey para Enrollment
         st.markdown("---")
