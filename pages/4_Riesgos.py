@@ -108,16 +108,36 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
                 cedulas_familia.append(ced_padre)
             if tiene_madre:
                 cedulas_familia.append(ced_madre)
+
             if cedulas_familia:
                 deudas_fam = deudas_mes7[
                     deudas_mes7["identificacion"].isin(cedulas_familia)
                 ]
+
+                # Verifica que haya deuda D/E
                 if (
                     not deudas_fam.empty
                     and deudas_fam["cod_calificacion"].isin(["D", "E"]).any()
                 ):
-                    motivos.append("Deuda familiar crítica (D/E)")
-                    contador += 1
+                    # Calcular deuda total del hogar
+                    deuda_total = deudas_fam["valor"].sum()
+
+                    # Calcular ingreso anual del hogar (junio 2025, multiplicado por 14)
+                    ingreso_anual = 0
+                    if not df_ingresos.empty and "salario" in df_ingresos.columns:
+                        ingresos_junio = df_ingresos[
+                            (df_ingresos["anio"] == 2025) & (df_ingresos["mes"] == 6)
+                        ]
+                        if not ingresos_junio.empty:
+                            ingresos_fam = ingresos_junio[
+                                ingresos_junio["identificacion"].isin(cedulas_familia)
+                            ]
+                            ingreso_anual = ingresos_fam["salario"].sum() * 14
+
+                    # Aplica condición del ratio deuda/ingreso
+                    if ingreso_anual > 0 and (deuda_total / ingreso_anual) >= 2.90:
+                        motivos.append("Deuda familiar crítica (D/E)")
+                        contador += 1
 
         # --- Criterio 3: Bajó de quintil (marzo → junio 2025) ---
         if not df_ingresos.empty and "quintil" in df_ingresos.columns:

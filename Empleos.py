@@ -21,6 +21,230 @@ def _fmt_money(v: float) -> str:
         return str(v)
 
 
+EMPLEOS_VALIDOS = ["Relacion de Dependencia", "Afiliacion Voluntaria"]
+EMPLEOS_TODOS = EMPLEOS_VALIDOS + ["Desconocido"]
+
+
+def _normalizar_ids_familia(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ced_padre"] = (
+        df["ced_padre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+    df["ced_madre"] = (
+        df["ced_madre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+    return df
+
+
+def _personas_periodo(datos_filtrados, periodo) -> pd.Series:
+    df_personas = datos_filtrados["Personas"]
+    return df_personas.loc[
+        df_personas["periodo"] == periodo, "identificacion"
+    ].drop_duplicates()
+
+
+def _universo_familiares_periodo(datos_filtrados, periodo) -> pd.DataFrame:
+    ids = _personas_periodo(datos_filtrados, periodo)
+    df_u = datos_filtrados.get("Universo Familiares", pd.DataFrame())
+    if df_u.empty:
+        return pd.DataFrame()
+    u = df_u[df_u["identificacion"].isin(ids)].copy()
+    u = _normalizar_ids_familia(u)
+    # hogar_id
+    u["hogar_id"] = u.apply(
+        lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
+    )
+    u = u[(u["hogar_id"] != "") & ((u["ced_padre"] != "0") | (u["ced_madre"] != "0"))]
+    return u
+
+
+def _mapa_hogar_familia(u_valid: pd.DataFrame) -> pd.DataFrame:
+    pares = []
+    for _, r in u_valid.iterrows():
+        if r["ced_padre"] != "0":
+            pares.append((r["hogar_id"], r["ced_padre"]))
+        if r["ced_madre"] != "0":
+            pares.append((r["hogar_id"], r["ced_madre"]))
+    if not pares:
+        return pd.DataFrame(columns=["hogar_id", "fam_id"])
+    return pd.DataFrame(pares, columns=["hogar_id", "fam_id"]).drop_duplicates()
+
+
+def _ingresos_mes6(datos_filtrados) -> pd.DataFrame:
+    df_ing = datos_filtrados.get("Ingresos", pd.DataFrame())
+    if df_ing.empty:
+        return pd.DataFrame(columns=["identificacion", "salario", "tipo_empleo"])
+    df = df_ing[(df_ing["anio"] == 2025) & (df_ing["mes"] == 6)].copy()
+    # tipificar y sanitizar
+    df["tipo_empleo"] = df["tipo_empleo"].astype(str).str.strip()
+    df["salario"] = pd.to_numeric(df["salario"], errors="coerce")
+    return df[["identificacion", "salario", "tipo_empleo"]]
+
+
+def construir_enrollment_filtrado(
+    datos_filtrados,
+    periodo: str,
+    cant_papas: int | None,
+    cant_papas_trab: int | None,
+    tipos_empleo_seleccionados: list[str],
+):
+    """
+    Devuelve un dict con:
+      - familiares_ids: set[str]
+      - hogares_ids: set[str]
+      - df_hogar_salarios: DataFrame con salario total JUN/2025 por hogar (solo filtrados)
+      - resumen: dict con counts útiles
+    Todos los filtros se aplican aquí.
+    """
+    u = _universo_familiares_periodo(datos_filtrados, periodo)
+    if u.empty:
+        return {
+            "familiares_ids": set(),
+            "hogares_ids": set(),
+            "df_hogar_salarios": pd.DataFrame(columns=["hogar_id", "salario"]),
+            "resumen": {
+                "total_hogares": 0,
+                "total_familiares": 0,
+                "hogares_por_papas": 0,
+                "hogares_por_papas_trab": 0,
+            },
+        }
+
+    # -- cantidad de papás en hogar (1 o 2)
+    u["n_papas"] = (u["ced_padre"].ne("0")).astype(int) + (
+        u["ced_madre"].ne("0")
+    ).astype(int)
+    if cant_papas in (1, 2):
+        u = u[u["n_papas"] == cant_papas]
+    if u.empty:
+        return {
+            "familiares_ids": set(),
+            "hogares_ids": set(),
+            "df_hogar_salarios": pd.DataFrame(columns=["hogar_id", "salario"]),
+            "resumen": {
+                "total_hogares": 0,
+                "total_familiares": 0,
+                "hogares_por_papas": 0,
+                "hogares_por_papas_trab": 0,
+            },
+        }
+
+    df_mapa = _mapa_hogar_familia(u)
+    if df_mapa.empty:
+        return {
+            "familiares_ids": set(),
+            "hogares_ids": set(),
+            "df_hogar_salarios": pd.DataFrame(columns=["hogar_id", "salario"]),
+            "resumen": {
+                "total_hogares": u["hogar_id"].nunique(),
+                "total_familiares": 0,
+                "hogares_por_papas": u["hogar_id"].nunique(),
+                "hogares_por_papas_trab": 0,
+            },
+        }
+
+    # Ingresos JUN/2025
+    ing6 = _ingresos_mes6(datos_filtrados)
+
+    # Tipo de empleo por familiar en JUN/2025 (Desconocido si no aparece)
+    df_emp = df_mapa.merge(
+        ing6, left_on="fam_id", right_on="identificacion", how="left"
+    )
+    df_emp["tipo_empleo_mes6"] = df_emp["tipo_empleo"].where(
+        df_emp["tipo_empleo"].isin(EMPLEOS_VALIDOS), "Desconocido"
+    )
+
+    # -- filtro por tipo de empleo (sobre personas)
+    if tipos_empleo_seleccionados and set(tipos_empleo_seleccionados) != set(
+        EMPLEOS_TODOS
+    ):
+        personas_validas = set(
+            df_emp.loc[
+                df_emp["tipo_empleo_mes6"].isin(tipos_empleo_seleccionados), "fam_id"
+            ]
+        )
+        df_emp = df_emp[df_emp["fam_id"].isin(personas_validas)]
+
+    # Recalcular hogares/personas después del filtro por tipo
+    if df_emp.empty:
+        return {
+            "familiares_ids": set(),
+            "hogares_ids": set(),
+            "df_hogar_salarios": pd.DataFrame(columns=["hogar_id", "salario"]),
+            "resumen": {
+                "total_hogares": 0,
+                "total_familiares": 0,
+                "hogares_por_papas": 0,
+                "hogares_por_papas_trab": 0,
+            },
+        }
+
+    # ¿Quién trabaja en JUN/2025?
+    df_emp["trabaja_mes6"] = df_emp["tipo_empleo_mes6"].isin(EMPLEOS_VALIDOS)
+
+    # Conteos por hogar
+    agg = (
+        df_emp.groupby("hogar_id")
+        .agg(n_papas=("fam_id", "nunique"), n_trab=("trabaja_mes6", "sum"))
+        .reset_index()
+    )
+
+    # -- filtro por cantidad de papás trabajando (0/1/2)
+    if cant_papas_trab in (0, 1, 2):
+        agg = agg[agg["n_trab"] == cant_papas_trab]
+
+    if agg.empty:
+        return {
+            "familiares_ids": set(),
+            "hogares_ids": set(),
+            "df_hogar_salarios": pd.DataFrame(columns=["hogar_id", "salario"]),
+            "resumen": {
+                "total_hogares": 0,
+                "total_familiares": 0,
+                "hogares_por_papas": 0,
+                "hogares_por_papas_trab": 0,
+            },
+        }
+
+    hogares_filtrados = set(agg["hogar_id"])
+    df_emp = df_emp[df_emp["hogar_id"].isin(hogares_filtrados)]
+
+    # IDs finales de familiares
+    familiares_ids = set(df_emp["fam_id"].unique())
+
+    # Salario del hogar (suma papá+mamá) en JUN/2025 SOLO para los familiares filtrados
+    # Ojo: df_emp ya trae 'salario' desde el primer merge con ing6
+    if "salario" not in df_emp.columns:
+        # fallback defensivo por si algún cambio upstream quitó 'salario'
+        df_emp = df_emp.merge(
+            ing6[["identificacion", "salario"]],
+            left_on="fam_id",
+            right_on="identificacion",
+            how="left",
+            suffixes=("", "_ing"),
+        )
+        # si hubo colisión, prioriza 'salario' y si no existe, usa 'salario_ing'
+        if "salario_ing" in df_emp.columns:
+            df_emp["salario"] = df_emp["salario"].fillna(df_emp["salario_ing"])
+
+    df_emp["salario"] = pd.to_numeric(df_emp["salario"], errors="coerce")
+    df_hogar_sal = df_emp.groupby("hogar_id", as_index=False)["salario"].sum()
+
+    return {
+        "familiares_ids": familiares_ids,
+        "hogares_ids": hogares_filtrados,
+        "df_hogar_salarios": df_hogar_sal,
+        "resumen": {
+            "total_hogares": len(hogares_filtrados),
+            "total_familiares": len(familiares_ids),
+            "hogares_por_papas": u["hogar_id"].nunique(),
+            "hogares_por_papas_trab": len(hogares_filtrados),
+        },
+        # también útil para calcular activos:
+        "df_emp": df_emp,  # columnas: hogar_id, fam_id, tipo_empleo_mes6, trabaja_mes6
+    }
+
+
 # Rangos de referencia JUN/2025 a nivel de HOGAR (suma papá+mamá)
 RANGOS_QUINTILES_HOGAR = [
     {"Quintil": 1, "Salario_Min": 1.13, "Salario_Max": 642.03},
@@ -513,7 +737,7 @@ def mostrar_tarjetas_quintiles(quintiles_dict, rangos_dict: dict | None = None):
         COLORES["verde"],  # Q5
     ]
 
-    st.write("**📊 Distribución por Quintiles de Ingresos**")
+    st.write("**📊 Distribución por Quintiles de Ingresos Hogar**")
 
     if not quintiles_dict:
         st.info("No hay datos de quintiles disponibles para este periodo")
@@ -1063,16 +1287,62 @@ if grupo_seleccionado in ["G", "A"]:  # Graduados o Afluentes
 else:  # Enrollment (E)
     st.subheader("📊 Análisis General - Enrollment")
 
-    # Mostrar periodo también para Enrollment
     if periodos:
-        st.write(f"### {periodos[0]}")
+        periodo_sel = periodos[0]
+        st.write(f"### {periodo_sel}")
 
-        # Calcular métricas de empleo para familiares de enrollment
-        activos, desempleados, total_hogares, hogares_con_trabajo = (
-            calcular_empleo_familiares(datos_filtrados, periodos[0])
+        # === NUEVOS FILTROS ===
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            cant_papas_opt = st.selectbox(
+                "Cantidad de papás en el hogar",
+                options=["Todos", 1, 2],
+                index=0,
+                help="Hogares con 1 o 2 representantes (excluye huérfanos).",
+            )
+            # Normaliza: None = no filtrar
+            cant_papas = None if cant_papas_opt == "Todos" else int(cant_papas_opt)
+
+        with c2:
+            cant_papas_trab_opt = st.selectbox(
+                "Cantidad de papás trabajando (JUN/2025)",
+                options=["Todos", 0, 1, 2],
+                index=0,
+                help="Se considera 'trabajando' si aparece en Ingresos 2025-06 con Relación de Dependencia o Afiliación Voluntaria.",
+            )
+            # Normaliza: None = no filtrar
+            cant_papas_trab = (
+                None if cant_papas_trab_opt == "Todos" else int(cant_papas_trab_opt)
+            )
+
+        with c3:
+            tipo_empleo_sel = st.selectbox(
+                "Tipo de empleo (JUN/2025)",
+                options=["Todos"] + EMPLEOS_TODOS,
+                index=0,
+                help="‘Desconocido’ = no aparece en Ingresos del mes 6/2025.",
+            )
+            # La función espera lista[str]
+            tipos_empleo_sel = (
+                EMPLEOS_TODOS if tipo_empleo_sel == "Todos" else [tipo_empleo_sel]
+            )
+
+        # Construir universo filtrado según los 3 filtros
+        universo = construir_enrollment_filtrado(
+            datos_filtrados, periodo_sel, cant_papas, cant_papas_trab, tipos_empleo_sel
         )
 
-        # Mostrar tarjetas de familiares
+        fam_ids = universo["familiares_ids"]
+        hogares_ids = universo["hogares_ids"]
+        df_hogar_sal = universo["df_hogar_salarios"]
+        df_emp = universo.get("df_emp", pd.DataFrame())
+
+        # ============ TARJETAS PRINCIPALES ============
+        total_familiares = universo["resumen"]["total_familiares"]
+        activos = int(df_emp["trabaja_mes6"].sum()) if not df_emp.empty else 0
+        desempleados = max(total_familiares - activos, 0)
+
         col_activos, col_desempleados = st.columns(2)
         with col_activos:
             tarjeta_simple("Empleo Formal - Familiares", activos, COLORES["verde"])
@@ -1084,42 +1354,147 @@ else:  # Enrollment (E)
         # Separador
         st.markdown("---")
 
-        # Mostrar tarjetas de hogares
+        # ============ TARJETAS DE HOGARES ============
+        total_hogares = universo["resumen"]["total_hogares"]
+        hogares_con_trabajo = 0
+        if not df_emp.empty:
+            hogares_con_trabajo = (
+                df_emp.groupby("hogar_id")["trabaja_mes6"].max().sum()
+            )  # ≥1 trabajando
+
         col_total_hogares, col_hogares_trabajo = st.columns(2)
         with col_total_hogares:
-            tarjeta_simple("Total Hogares", total_hogares, COLORES["azul"])
+            tarjeta_simple("Total Hogares (filtrados)", total_hogares, COLORES["azul"])
         with col_hogares_trabajo:
             tarjeta_simple(
-                "Hogares con Trabajo", hogares_con_trabajo, COLORES["amarillo"]
+                "Hogares con Trabajo", int(hogares_con_trabajo), COLORES["amarillo"]
             )
 
-        # Boxplot por hogar
+        # ============ BOXPLOT POR HOGAR ============
         st.markdown("---")
         st.write("**🏠 Distribución de Salarios Familiares (por hogar)**")
-        fig_hogar = crear_boxplot_salarios_hogares(
-            datos_filtrados, periodos[0], grupo_seleccionado
-        )
-        if fig_hogar:
-            st.plotly_chart(fig_hogar, use_container_width=True)
+        if not df_hogar_sal.empty:
+            salarios = filtrar_outliers_iqr(df_hogar_sal["salario"], k=1.5)
+            if not salarios.empty:
+                fig_hogar = go.Figure()
+                fig_hogar.add_trace(
+                    go.Box(
+                        y=salarios,
+                        name="Salarios por Hogar",
+                        boxpoints=False,
+                        marker_color="lightgreen",
+                        line_color="darkgreen",
+                    )
+                )
+                fig_hogar.update_layout(
+                    title=f"Distribución de Salarios por Hogar - Familiares Enrollment {periodo_sel}",
+                    yaxis_title="Salario (USD)",
+                    height=400,
+                    showlegend=False,
+                    yaxis=dict(tickformat="$,.0f"),
+                )
+                st.plotly_chart(fig_hogar, use_container_width=True)
+            else:
+                st.info("No hay salarios válidos tras filtrar outliers.")
         else:
-            st.info("No hay datos de salarios por hogar disponibles para este periodo")
+            st.info("No hay datos de salarios por hogar con los filtros actuales.")
 
-        # Agregar tarjetas de quintiles
+        # ============ QUINTILES POR HOGAR ============
         st.markdown("---")
-        quintiles = calcular_quintiles_hogares(
-            datos_filtrados, periodos[0], grupo_seleccionado
-        )
-        mostrar_tarjetas_quintiles(quintiles, rangos_dict=rangos_quintiles_hogar_dict())
+        if not df_hogar_sal.empty:
 
-        # Agregar diagrama de Sankey para Enrollment
-        st.markdown("---")
-        st.write("**🔄 Transiciones de Tipo de Empleo**")
-        fig_sankey = crear_diagrama_sankey(
-            datos_filtrados, periodos[0], grupo_seleccionado
-        )
-        if fig_sankey:
-            st.plotly_chart(fig_sankey, use_container_width=True)
+            def asignar_quintil(s):
+                for q in RANGOS_QUINTILES_HOGAR:
+                    if q["Salario_Min"] <= s <= q["Salario_Max"]:
+                        return q["Quintil"]
+                return None
+
+            df_q = df_hogar_sal.copy()
+            df_q["quintil"] = df_q["salario"].apply(asignar_quintil)
+            counts = df_q["quintil"].value_counts().sort_index()
+            total = counts.sum()
+            quintiles = {
+                f"Quintil {i}": (counts.get(i, 0) / total * 100 if total else 0)
+                for i in range(1, 6)
+            }
+            mostrar_tarjetas_quintiles(
+                quintiles, rangos_dict=rangos_quintiles_hogar_dict()
+            )
         else:
-            st.info("No hay datos suficientes para mostrar transiciones de empleo")
+            st.info("No hay hogares para calcular quintiles con los filtros actuales.")
+
+        # ============ SANKEY (Mar→Jun) SOLO PERSONAS FILTRADAS ============
+        st.markdown("---")
+        st.write("**🔄 Transiciones de Tipo de Empleo (Marzo → Junio)**")
+        df_ing = datos_filtrados.get("Ingresos", pd.DataFrame())
+        if not df_ing.empty and fam_ids:
+            df_ing_fam = df_ing[df_ing["identificacion"].isin(fam_ids)]
+            df_mes3 = df_ing_fam[
+                (df_ing_fam["anio"] == 2025) & (df_ing_fam["mes"] == 3)
+            ]
+            df_mes6 = df_ing_fam[
+                (df_ing_fam["anio"] == 2025) & (df_ing_fam["mes"] == 6)
+            ]
+
+            empleo_mes3 = dict(zip(df_mes3["identificacion"], df_mes3["tipo_empleo"]))
+            empleo_mes6 = dict(zip(df_mes6["identificacion"], df_mes6["tipo_empleo"]))
+
+            tipos = ["Relacion de Dependencia", "Afiliacion Voluntaria", "Desconocido"]
+
+            nodos_marzo = [f"{t} (Marzo)" for t in tipos]
+            nodos_junio = [f"{t} (Junio)" for t in tipos]
+            todos_nodos = nodos_marzo + nodos_junio
+            idx = {n: i for i, n in enumerate(todos_nodos)}
+
+            from collections import Counter
+
+            trans = []
+            for p in fam_ids:
+                o = empleo_mes3.get(p, "Desconocido")
+                d = empleo_mes6.get(p, "Desconocido")
+                if o not in tipos:
+                    o = "Desconocido"
+                if d not in tipos:
+                    d = "Desconocido"
+                trans.append((o, d))
+            c = Counter(trans)
+
+            src, tgt, val = [], [], []
+            for (o, d), k in c.items():
+                if k > 0:
+                    src.append(idx[f"{o} (Marzo)"])
+                    tgt.append(idx[f"{d} (Junio)"])
+                    val.append(k)
+
+            if val:
+                fig_sankey = go.Figure(
+                    data=[
+                        go.Sankey(
+                            node=dict(
+                                pad=15,
+                                thickness=20,
+                                line=dict(color="black", width=0.5),
+                                label=todos_nodos,
+                                color=["#ff6b6b", "#4ecdc4", "#45b7d1"] * 2,
+                            ),
+                            link=dict(
+                                source=src,
+                                target=tgt,
+                                value=val,
+                                color="rgba(0,0,0,0.3)",
+                            ),
+                        )
+                    ]
+                )
+                fig_sankey.update_layout(
+                    title=f"Transiciones de Tipo de Empleo - Familiares Enrollment {periodo_sel} (Marzo → Junio)",
+                    font_size=12,
+                    height=500,
+                )
+                st.plotly_chart(fig_sankey, use_container_width=True)
+            else:
+                st.info("No hay transiciones para mostrar con los filtros actuales.")
+        else:
+            st.info("No hay datos suficientes para mostrar transiciones de empleo.")
     else:
         st.write("No hay periodos disponibles para este grupo")

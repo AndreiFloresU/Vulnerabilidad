@@ -11,6 +11,92 @@ import numpy as np
 from utils.hogarUnico import make_hogar_id
 
 
+# =========================
+# Helpers y constantes
+# =========================
+EMPLEOS_VALIDOS = ["Relacion de Dependencia", "Afiliacion Voluntaria"]
+EMPLEOS_TODOS = EMPLEOS_VALIDOS + ["Desconocido"]
+
+
+def _ingresos_mes6_map(datos_filtrados) -> dict[str, str]:
+    """
+    Mapa identificacion -> tipo_empleo (Jun/2025).
+    Si no aparece, el tipo se considera 'Desconocido'.
+    """
+    df_ing = datos_filtrados.get("Ingresos", pd.DataFrame())
+    if df_ing.empty:
+        return {}
+    df = df_ing[(df_ing["anio"] == 2025) & (df_ing["mes"] == 6)][
+        ["identificacion", "tipo_empleo"]
+    ].copy()
+    if df.empty:
+        return {}
+    df["tipo_empleo"] = df["tipo_empleo"].astype(str).str.strip()
+    return dict(zip(df["identificacion"], df["tipo_empleo"]))
+
+
+def _aplicar_filtros_papas_familia(
+    familias_df: pd.DataFrame,
+    tipo_map: dict[str, str],
+    cant_papas: int | None,
+    cant_papas_trab: int | None,
+    tipo_empleo_sel: str | None,  # "Todos" o un tipo puntual
+) -> pd.DataFrame:
+    """
+    Agrega columnas auxiliares (n_papas, n_trab, tipo_padre/madre, trabaja_padre/madre)
+    y aplica los 3 filtros. Devuelve el DataFrame filtrado.
+    """
+    if familias_df.empty:
+        return familias_df
+
+    df = familias_df.copy()
+
+    # IDs limpios
+    df["ced_padre"] = (
+        df["ced_padre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+    df["ced_madre"] = (
+        df["ced_madre"].astype(str).str.strip().replace({"": "0", "nan": "0"})
+    )
+
+    # tipos por padre/madre (Desconocido si no está en Ingresos)
+    def tipo_de(emp_id: str) -> str:
+        if emp_id == "0":
+            return "Desconocido"
+        t = tipo_map.get(emp_id, "Desconocido")
+        return t if t in EMPLEOS_VALIDOS else "Desconocido"
+
+    df["tipo_padre"] = df["ced_padre"].map(tipo_de)
+    df["tipo_madre"] = df["ced_madre"].map(tipo_de)
+
+    # quién trabaja en JUN/2025 (según tipo)
+    df["trabaja_padre"] = df["tipo_padre"].isin(EMPLEOS_VALIDOS)
+    df["trabaja_madre"] = df["tipo_madre"].isin(EMPLEOS_VALIDOS)
+
+    # cantidad de papás y de papás trabajando
+    df["n_papas"] = (df["ced_padre"] != "0").astype(int) + (
+        df["ced_madre"] != "0"
+    ).astype(int)
+    df["n_trab"] = df["trabaja_padre"].astype(int) + df["trabaja_madre"].astype(int)
+
+    # (1) filtro cantidad de papás
+    if cant_papas in (1, 2):
+        df = df[df["n_papas"] == cant_papas]
+
+    # (2) filtro tipo de empleo seleccionado (única opción)
+    if tipo_empleo_sel and tipo_empleo_sel != "Todos":
+        df = df[
+            (df["tipo_padre"] == tipo_empleo_sel)
+            | (df["tipo_madre"] == tipo_empleo_sel)
+        ]
+
+    # (3) filtro cantidad de papás trabajando
+    if cant_papas_trab in (0, 1, 2):
+        df = df[df["n_trab"] == cant_papas_trab]
+
+    return df
+
+
 def _remove_outliers_iqr(
     df: pd.DataFrame, cols: list[str], k: float = 1.5
 ) -> pd.DataFrame:
@@ -18,8 +104,12 @@ def _remove_outliers_iqr(
     Filtra outliers por IQR en las columnas indicadas.
     Mantiene filas que estén dentro de [Q1 - k*IQR, Q3 + k*IQR] para *todas* las cols.
     """
+    if df.empty:
+        return df
     mask = pd.Series([True] * len(df), index=df.index)
     for c in cols:
+        if c not in df.columns:
+            continue
         q1 = df[c].quantile(0.25)
         q3 = df[c].quantile(0.75)
         iqr = q3 - q1
@@ -52,13 +142,11 @@ def mediana_salario_por_hogar(familias_df: pd.DataFrame) -> float:
         return 0.0
 
     tmp = familias_df.copy()
-
     tmp["hogar_id"] = tmp.apply(
         lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
     )
     tmp = tmp[tmp["hogar_id"] != ""]
 
-    # tomar un valor por hogar
     salarios_hogares = tmp.groupby("hogar_id", as_index=False)[
         "salario_familiar"
     ].first()["salario_familiar"]
@@ -69,14 +157,6 @@ def mediana_salario_por_hogar(familias_df: pd.DataFrame) -> float:
 def obtener_datos_familias(datos_filtrados, periodo, grupo_seleccionado):
     """
     Obtiene los datos de familias combinando información de estudiantes, padres y madres
-
-    Args:
-        datos_filtrados: Diccionario con los datos filtrados
-        periodo: Periodo específico
-        grupo_seleccionado: Tipo de grupo (A o E)
-
-    Returns:
-        pd.DataFrame: Datos de familias con información completa
     """
     # Obtener estudiantes del periodo
     df_personas = datos_filtrados["Personas"]
@@ -99,18 +179,12 @@ def obtener_datos_familias(datos_filtrados, periodo, grupo_seleccionado):
 def obtener_datos_empleabilidad_familia(datos_filtrados, familias_df):
     """
     Obtiene información de empleabilidad (desempleo) de las familias
-
-    Args:
-        datos_filtrados: Diccionario con los datos filtrados
-        familias_df: DataFrame con datos de familias
-
-    Returns:
-        pd.DataFrame: Familias con información de empleabilidad
     """
     # Obtener datos de ingresos para determinar empleabilidad
     df_ingresos = datos_filtrados.get("Ingresos", pd.DataFrame())
 
     # Inicializar columnas de empleabilidad
+    familias_df = familias_df.copy()
     familias_df["padre_desempleado"] = True  # Inicialmente asumir desempleado
     familias_df["madre_desempleado"] = True  # Inicialmente asumir desempleado
     familias_df["familia_con_desempleo"] = False
@@ -135,9 +209,7 @@ def obtener_datos_empleabilidad_familia(datos_filtrados, familias_df):
                         familia["ced_padre"] not in personas_empleadas
                     )
                 else:
-                    familias_df.loc[idx, "padre_desempleado"] = (
-                        False  # No aplica si no existe padre
-                    )
+                    familias_df.loc[idx, "padre_desempleado"] = False  # No aplica
 
                 # Verificar si la madre está empleada
                 if familia["ced_madre"] != "0":
@@ -145,24 +217,21 @@ def obtener_datos_empleabilidad_familia(datos_filtrados, familias_df):
                         familia["ced_madre"] not in personas_empleadas
                     )
                 else:
-                    familias_df.loc[idx, "madre_desempleado"] = (
-                        False  # No aplica si no existe madre
-                    )
+                    familias_df.loc[idx, "madre_desempleado"] = False  # No aplica
 
                 # Familia tiene desempleo si al menos un padre/madre válido está desempleado
                 tiene_padre_valido = familia["ced_padre"] != "0"
                 tiene_madre_valida = familia["ced_madre"] != "0"
 
-                padre_desempleado = (
+                padre_desemp = (
                     tiene_padre_valido and familias_df.loc[idx, "padre_desempleado"]
                 )
-                madre_desempleada = (
+                madre_desemp = (
                     tiene_madre_valida and familias_df.loc[idx, "madre_desempleado"]
                 )
 
-                # La familia tiene desempleo si algún familiar válido está desempleado
                 familias_df.loc[idx, "familia_con_desempleo"] = (
-                    padre_desempleado or madre_desempleada
+                    padre_desemp or madre_desemp
                 )
 
     return familias_df
@@ -171,13 +240,6 @@ def obtener_datos_empleabilidad_familia(datos_filtrados, familias_df):
 def obtener_datos_salario_deuda_familia(datos_filtrados, familias_df):
     """
     Combina salarios y deudas familiares (suma de padre + madre)
-
-    Args:
-        datos_filtrados: Diccionario con los datos filtrados
-        familias_df: DataFrame con datos de familias
-
-    Returns:
-        pd.DataFrame: Familias con salario total y deuda total familiar
     """
     # Obtener datos de salarios e ingresos
     df_ingresos = datos_filtrados.get("Ingresos", pd.DataFrame())
@@ -197,21 +259,21 @@ def obtener_datos_salario_deuda_familia(datos_filtrados, familias_df):
         if "salario" in ingresos_mes6.columns and not ingresos_mes6.empty:
             # Sumar salarios por familia
             for idx, familia in result_familias.iterrows():
-                salario_total = 0
+                salario_total = 0.0
 
                 # Salario del padre
                 if familia["ced_padre"] != "0":
                     salario_padre = ingresos_mes6[
                         ingresos_mes6["identificacion"] == familia["ced_padre"]
                     ]["salario"].sum()
-                    salario_total += salario_padre * 14
+                    salario_total += float(salario_padre) * 14
 
                 # Salario de la madre
                 if familia["ced_madre"] != "0":
                     salario_madre = ingresos_mes6[
                         ingresos_mes6["identificacion"] == familia["ced_madre"]
                     ]["salario"].sum()
-                    salario_total += salario_madre * 14
+                    salario_total += float(salario_madre) * 14
 
                 result_familias.loc[idx, "salario_familiar"] = salario_total
 
@@ -223,120 +285,25 @@ def obtener_datos_salario_deuda_familia(datos_filtrados, familias_df):
         if "valor" in deudas_mes6.columns and not deudas_mes6.empty:
             # Sumar deudas por familia
             for idx, familia in result_familias.iterrows():
-                deuda_total = 0
+                deuda_total = 0.0
 
                 # Deuda del padre
                 if familia["ced_padre"] != "0":
                     deuda_padre = deudas_mes6[
                         deudas_mes6["identificacion"] == familia["ced_padre"]
                     ]["valor"].sum()
-                    deuda_total += deuda_padre
+                    deuda_total += float(deuda_padre)
 
                 # Deuda de la madre
                 if familia["ced_madre"] != "0":
                     deuda_madre = deudas_mes6[
                         deudas_mes6["identificacion"] == familia["ced_madre"]
                     ]["valor"].sum()
-                    deuda_total += deuda_madre
+                    deuda_total += float(deuda_madre)
 
                 result_familias.loc[idx, "deuda_familiar"] = deuda_total
 
     return result_familias
-
-
-def crear_treemap_desempleo(familias_df, periodo, grupo_seleccionado):
-    """
-    Crea un treemap mostrando % de familias con al menos un padre/madre desempleado
-    """
-    if familias_df.empty:
-        return None
-
-    # Calcular estadísticas de desempleo
-    total_familias = len(familias_df)
-    familias_con_desempleo = (
-        familias_df["familia_con_desempleo"].sum()
-        if "familia_con_desempleo" in familias_df.columns
-        else 0
-    )
-    familias_sin_desempleo = total_familias - familias_con_desempleo
-
-    # Preparar datos para treemap
-    data_treemap = pd.DataFrame(
-        {
-            "categoria": ["Con Desempleo", "Sin Desempleo"],
-            "cantidad": [familias_con_desempleo, familias_sin_desempleo],
-            "porcentaje": [
-                (
-                    (familias_con_desempleo / total_familias * 100)
-                    if total_familias > 0
-                    else 0
-                ),
-                (
-                    (familias_sin_desempleo / total_familias * 100)
-                    if total_familias > 0
-                    else 0
-                ),
-            ],
-        }
-    )
-
-    # Crear treemap
-    fig = px.treemap(
-        data_treemap,
-        path=["categoria"],
-        values="cantidad",
-        title=f"Distribución de Desempleo Familiar - {grupo_seleccionado} {periodo}",
-        color="porcentaje",
-        color_continuous_scale="RdYlGn_r",
-        hover_data={"porcentaje": ":.1f"},
-    )
-
-    fig.update_layout(height=400)
-    return fig
-
-
-def crear_donut_desempleo(familias_df, periodo, grupo_seleccionado):
-    """
-    Crea un donut chart mostrando % de familias con desempleo
-    """
-    if familias_df.empty:
-        return None
-
-    # Calcular estadísticas
-    total_familias = len(familias_df)
-    familias_con_desempleo = (
-        familias_df["familia_con_desempleo"].sum()
-        if "familia_con_desempleo" in familias_df.columns
-        else 0
-    )
-    familias_sin_desempleo = total_familias - familias_con_desempleo
-
-    # Preparar datos
-    data_donut = pd.DataFrame(
-        {
-            "categoria": ["Con Desempleo", "Sin Desempleo"],
-            "cantidad": [familias_con_desempleo, familias_sin_desempleo],
-        }
-    )
-
-    # Crear donut chart
-    fig = px.pie(
-        data_donut,
-        values="cantidad",
-        names="categoria",
-        title=f"Proporción de Familias con Desempleo - {grupo_seleccionado} {periodo}",
-        hole=0.4,
-        color_discrete_sequence=["#FF6B6B", "#4ECDC4"],
-    )
-
-    fig.update_traces(
-        textposition="inside",
-        textinfo="percent+label",
-        hovertemplate="<b>%{label}</b><br>Familias: %{value}<br>Porcentaje: %{percent}<extra></extra>",
-    )
-
-    fig.update_layout(height=400)
-    return fig
 
 
 def crear_scatter_salario_deuda(familias_df, periodo, grupo_seleccionado):
@@ -344,7 +311,6 @@ def crear_scatter_salario_deuda(familias_df, periodo, grupo_seleccionado):
         return None
 
     tmp = familias_df.copy()
-
     tmp["hogar_id"] = tmp.apply(
         lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
     )
@@ -405,10 +371,14 @@ def calcular_salario_promedio_por_hogar(familias_df: pd.DataFrame) -> float:
     hogares = familias_df.copy()
 
     # Asegura strings limpios; trata vacío como "0"
-    hogares["ced_padre"] = hogares["ced_padre"].str.strip().replace({"": "0"})
-    hogares["ced_madre"] = hogares["ced_madre"].str.strip().replace({"": "0"})
+    hogares["ced_padre"] = (
+        hogares["ced_padre"].astype(str).str.strip().replace({"": "0"})
+    )
+    hogares["ced_madre"] = (
+        hogares["ced_madre"].astype(str).str.strip().replace({"": "0"})
+    )
 
-    # ID estable de hogar sin usar apply (más rápido)
+    # ID estable de hogar
     hogares["hogar_id"] = hogares.apply(
         lambda r: make_hogar_id(r["ced_padre"], r["ced_madre"]), axis=1
     )
@@ -424,19 +394,20 @@ def calcular_salario_promedio_por_hogar(familias_df: pd.DataFrame) -> float:
     return float(salario_promedio_hogar) if pd.notnull(salario_promedio_hogar) else 0.0
 
 
-# Configuración de la página
+# =========================
+# Página
+# =========================
 st.set_page_config(
     page_title="Análisis de Familias", page_icon="👨‍👩‍👧‍👦", layout="wide"
 )
 
-# Título principal
 st.title("👨‍👩‍👧‍👦 Análisis de Familias")
 
 # Cargar datos
 df_vulnerabilidad = cargar_datos_vulnerabilidad()
 
 
-# Función personalizada para mostrar filtros solo para Enrollment y Afluentes
+# Filtros personalizados para familias (solo E y A)
 def mostrar_filtros_familias(df_personas: pd.DataFrame, key_suffix: str = ""):
     """
     Muestra los filtros solo para Enrollment (E) y Afluentes (A)
@@ -453,7 +424,7 @@ def mostrar_filtros_familias(df_personas: pd.DataFrame, key_suffix: str = ""):
             "Grupo de interés:",
             options=list(opciones_grupo.keys()),
             format_func=lambda x: opciones_grupo[x],
-            index=0,  # Por defecto "E" (Enrollment)
+            index=0,  # Por defecto "E"
             key=f"grupo_interes_familias_{key_suffix}",
         )
 
@@ -468,12 +439,12 @@ def mostrar_filtros_familias(df_personas: pd.DataFrame, key_suffix: str = ""):
         facultad_seleccionada = st.selectbox(
             "Facultad:",
             options=facultades_disponibles,
-            index=0,  # Por defecto "Todos"
+            index=0,  # "Todos"
             key=f"facultad_familias_{key_suffix}",
         )
 
     with col3:
-        # Carrera (depende del grupo de interés y facultad seleccionada)
+        # Carrera (depende del grupo y facultad)
         from utils.filtros import obtener_carreras_por_grupo_y_facultad
 
         carreras_disponibles = obtener_carreras_por_grupo_y_facultad(
@@ -483,29 +454,67 @@ def mostrar_filtros_familias(df_personas: pd.DataFrame, key_suffix: str = ""):
         carrera_seleccionada = st.selectbox(
             "Carrera:",
             options=carreras_disponibles,
-            index=0,  # Por defecto "Todos"
+            index=0,  # "Todos"
             key=f"carrera_familias_{key_suffix}",
         )
 
     return grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
 
 
-# Mostrar filtros personalizados para familias
+# Mostrar filtros
 grupo_seleccionado, facultad_seleccionada, carrera_seleccionada = (
     mostrar_filtros_familias(df_vulnerabilidad["Personas"], key_suffix="familias")
 )
 
-# Aplicar filtros
+# Aplicar filtros generales (grupo/facultad/carrera)
 datos_filtrados = aplicar_filtros(
     df_vulnerabilidad, grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
 )
 
-# Validar que solo se muestren Afluentes y Enrollment (ya no es necesario porque los filtros solo permiten E y A)
-# El código anterior de validación se elimina porque ya no es posible seleccionar "G"
-
-# Obtener periodos únicos del grupo seleccionado
+# Periodos disponibles
 df_personas_filtrado = datos_filtrados["Personas"]
 periodos = sorted(df_personas_filtrado["periodo"].dropna().unique().tolist())
+
+# === Filtros específicos SOLO para Enrollment (E) ===
+if grupo_seleccionado == "E":
+    fc1, fc2, fc3 = st.columns(3)
+
+    with fc1:
+        cant_papas_opt = st.selectbox(
+            "Cantidad de papás en el hogar",
+            options=["Todos", 1, 2],
+            index=0,
+            help="Hogares con 1 o 2 representantes (excluye huérfanos).",
+            key="f_cant_papas_familias",
+        )
+        cant_papas = None if cant_papas_opt == "Todos" else int(cant_papas_opt)
+
+    with fc2:
+        cant_papas_trab_opt = st.selectbox(
+            "Cantidad de papás trabajando (JUN/2025)",
+            options=["Todos", 0, 1, 2],
+            index=0,
+            help="Se considera 'trabajando' si aparece en Ingresos 2025-06 con Relación de Dependencia o Afiliación Voluntaria.",
+            key="f_cant_papas_trab_familias",
+        )
+        cant_papas_trab = (
+            None if cant_papas_trab_opt == "Todos" else int(cant_papas_trab_opt)
+        )
+
+    with fc3:
+        tipo_empleo_sel = st.selectbox(
+            "Tipo de empleo (JUN/2025)",
+            options=["Todos"] + EMPLEOS_TODOS,
+            index=0,
+            help="‘Desconocido’ = no aparece en Ingresos del mes 6/2025.",
+            key="f_tipo_empleo_familias",
+        )
+else:
+    # Si es A (Afluentes), no aplicamos estos filtros
+    cant_papas = None
+    cant_papas_trab = None
+    tipo_empleo_sel = "Todos"
+
 
 if periodos:
     st.subheader(f"📊 Análisis Familiar - {grupo_seleccionado}")
@@ -515,6 +524,9 @@ if periodos:
         # Dividir en dos columnas para mostrar los periodos
         col1, col_divider, col2 = st.columns([1, 0.05, 1])
 
+        # --------------------
+        # Columna izquierda
+        # --------------------
         with col1:
             st.write(f"### {periodos[0]}")
 
@@ -522,6 +534,13 @@ if periodos:
             familias_df = obtener_datos_familias(
                 datos_filtrados, periodos[0], grupo_seleccionado
             )
+
+            # ✅ Aplicar filtros SOLO si es Enrollment
+            if grupo_seleccionado == "E" and not familias_df.empty:
+                tipo_map = _ingresos_mes6_map(datos_filtrados)
+                familias_df = _aplicar_filtros_papas_familia(
+                    familias_df, tipo_map, cant_papas, cant_papas_trab, tipo_empleo_sel
+                )
 
             if not familias_df.empty:
                 # Procesar datos de empleabilidad
@@ -555,10 +574,10 @@ if periodos:
                         f"${mediana_salario:,.0f}",
                         COLORES["verde"],
                     )
-
             else:
                 st.info("No hay datos de familias disponibles para este periodo")
 
+        # divisor visual
         with col_divider:
             st.markdown(
                 """
@@ -571,6 +590,9 @@ if periodos:
                 unsafe_allow_html=True,
             )
 
+        # --------------------
+        # Columna derecha
+        # --------------------
         with col2:
             st.write(f"### {periodos[1]}")
 
@@ -578,6 +600,13 @@ if periodos:
             familias_df2 = obtener_datos_familias(
                 datos_filtrados, periodos[1], grupo_seleccionado
             )
+
+            # ✅ Aplicar filtros SOLO si es Enrollment
+            if grupo_seleccionado == "E" and not familias_df2.empty:
+                tipo_map = _ingresos_mes6_map(datos_filtrados)
+                familias_df2 = _aplicar_filtros_papas_familia(
+                    familias_df2, tipo_map, cant_papas, cant_papas_trab, tipo_empleo_sel
+                )
 
             if not familias_df2.empty:
                 # Procesar datos de empleabilidad
@@ -613,22 +642,34 @@ if periodos:
                         f"${mediana_salario2:,.0f}",
                         COLORES["verde"],
                     )
-
             else:
                 st.info("No hay datos de familias disponibles para este periodo")
 
-        # Scatter plot de salario vs deuda para ambos periodos
+        # =========================
+        # Scatter plots (ambos periodos)
+        # =========================
         st.markdown("---")
         st.subheader("📈 Relación Salario vs Deuda Familiar")
 
-        # Crear dos columnas para los scatter plots
         scatter_col1, scatter_col2 = st.columns(2)
 
+        # Izquierda
         with scatter_col1:
-            # Scatter plot para el primer periodo
             familias_df_scatter1 = obtener_datos_familias(
                 datos_filtrados, periodos[0], grupo_seleccionado
             )
+
+            # ✅ Aplicar filtros SOLO si es Enrollment
+            if grupo_seleccionado == "E" and not familias_df_scatter1.empty:
+                tipo_map = _ingresos_mes6_map(datos_filtrados)
+                familias_df_scatter1 = _aplicar_filtros_papas_familia(
+                    familias_df_scatter1,
+                    tipo_map,
+                    cant_papas,
+                    cant_papas_trab,
+                    tipo_empleo_sel,
+                )
+
             if not familias_df_scatter1.empty:
                 familias_df_scatter1 = obtener_datos_salario_deuda_familia(
                     datos_filtrados, familias_df_scatter1
@@ -643,11 +684,23 @@ if periodos:
                         "No hay datos suficientes para mostrar la relación salario-deuda"
                     )
 
+        # Derecha
         with scatter_col2:
-            # Scatter plot para el segundo periodo
             familias_df_scatter2 = obtener_datos_familias(
                 datos_filtrados, periodos[1], grupo_seleccionado
             )
+
+            # ✅ Aplicar filtros SOLO si es Enrollment
+            if grupo_seleccionado == "E" and not familias_df_scatter2.empty:
+                tipo_map = _ingresos_mes6_map(datos_filtrados)
+                familias_df_scatter2 = _aplicar_filtros_papas_familia(
+                    familias_df_scatter2,
+                    tipo_map,
+                    cant_papas,
+                    cant_papas_trab,
+                    tipo_empleo_sel,
+                )
+
             if not familias_df_scatter2.empty:
                 familias_df_scatter2 = obtener_datos_salario_deuda_familia(
                     datos_filtrados, familias_df_scatter2
@@ -663,7 +716,9 @@ if periodos:
                     )
 
     else:
-        # Si hay un solo periodo o ninguno
+        # ==============
+        # Un solo periodo
+        # ==============
         periodo = periodos[0]
         st.write(f"### {periodo}")
 
@@ -671,6 +726,13 @@ if periodos:
         familias_df = obtener_datos_familias(
             datos_filtrados, periodo, grupo_seleccionado
         )
+
+        # ✅ Aplicar filtros SOLO si es Enrollment
+        if grupo_seleccionado == "E" and not familias_df.empty:
+            tipo_map = _ingresos_mes6_map(datos_filtrados)
+            familias_df = _aplicar_filtros_papas_familia(
+                familias_df, tipo_map, cant_papas, cant_papas_trab, tipo_empleo_sel
+            )
 
         if not familias_df.empty:
             # Procesar datos de empleabilidad
@@ -717,7 +779,6 @@ if periodos:
                 st.info(
                     "No hay datos suficientes para mostrar la relación salario-deuda"
                 )
-
         else:
             st.info("No hay datos de familias disponibles para este periodo")
 else:
