@@ -4,9 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from utils.carga_datos import cargar_datos_vulnerabilidad
 from utils.filtros import (
-    inicializar_filtros,
     aplicar_filtros,
-    mostrar_filtros_en_pagina,
+    mostrar_filtros,
 )
 from utils.tarjetas import tarjeta_simple, COLORES
 from utils.hogarUnico import make_hogar_id
@@ -795,17 +794,13 @@ st.title("💼 Empleos e Ingresos")
 # Cargar datos
 df_vulnerabilidad = cargar_datos_vulnerabilidad()
 
-# Inicializar filtros
-inicializar_filtros(df_vulnerabilidad)
+grupo_seleccionado, facultad_seleccionada, carrera_seleccionada = mostrar_filtros(
+    df_vulnerabilidad["Personas"], key_suffix="pagina1"  # Sufijo único para esta página
+)
 
-# Mostrar filtros en la página principal
-mostrar_filtros_en_pagina()
-
-# Aplicar filtros
-datos_filtrados = aplicar_filtros(df_vulnerabilidad)
-
-# Obtener el grupo seleccionado
-grupo_seleccionado = st.session_state.grupo_interes
+datos_filtrados = aplicar_filtros(
+    df_vulnerabilidad, grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
+)
 
 # Obtener periodos únicos del grupo seleccionado, ordenados alfabéticamente
 df_personas_filtrado = datos_filtrados["Personas"]

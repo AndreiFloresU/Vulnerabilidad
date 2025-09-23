@@ -4,7 +4,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from utils.carga_datos import cargar_datos_vulnerabilidad
 from utils.filtros import (
-    inicializar_filtros,
     aplicar_filtros,
     obtener_facultades_por_grupo,
     obtener_carreras_por_grupo_y_facultad,
@@ -102,7 +101,7 @@ def calcular_vulnerabilidad_estudiantes(datos_filtrados, periodo):
                     motivos.append("Familia sin empleo")
                     contador += 1
 
-        # --- Criterio 2: Deuda familiar crítica (D/E) en junio 2025 ---
+        # --- Criterio 2: Deuda familiar crítica (D/E) en julio 2025 ---
         if not deudas_mes7.empty and "cod_calificacion" in deudas_mes7.columns:
             cedulas_familia = []
             if tiene_padre:
@@ -281,21 +280,24 @@ st.set_page_config(page_title="Análisis de Riesgos", page_icon="⚠️", layout
 st.title("⚠️ Análisis de Riesgos")
 
 # Cargar datos
+from utils.carga_datos import cargar_datos_vulnerabilidad
+
 df_vulnerabilidad = cargar_datos_vulnerabilidad()
 
-# Inicializar filtros
-inicializar_filtros(df_vulnerabilidad)
+# --- Filtros personalizados (solo Enrollment) ---
+from utils.filtros import (
+    obtener_facultades_por_grupo,
+    obtener_carreras_por_grupo_y_facultad,
+    aplicar_filtros,
+)
 
-# Mostrar filtros personalizados (solo Enrollment)
 st.header("🔍 Filtros")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    # Solo mostrar Enrollment
-    st.session_state.grupo_interes = "E"
-    st.selectbox(
+    grupo_seleccionado = st.selectbox(
         "Grupo de interés:",
-        options=["E"],
+        options=["E"],  # solo Enrollment
         format_func=lambda x: "Enrollment",
         index=0,
         disabled=True,
@@ -303,43 +305,40 @@ with col1:
     )
 
 with col2:
-    # Facultad (filtrada según enrollment)
-    facultades_filtradas = obtener_facultades_por_grupo("E")
-    if st.session_state.facultad_seleccionada not in facultades_filtradas:
-        st.session_state.facultad_seleccionada = "Todos"
-    st.session_state.facultad_seleccionada = st.selectbox(
+    facultades_filtradas = obtener_facultades_por_grupo(
+        df_vulnerabilidad["Personas"], grupo_seleccionado
+    )
+    facultad_seleccionada = st.selectbox(
         "Facultad:",
         options=facultades_filtradas,
-        index=facultades_filtradas.index(st.session_state.facultad_seleccionada),
+        index=0,
         key="facultad_seleccionada_riesgos",
     )
 
 with col3:
-    # Carrera (filtrada según enrollment y facultad)
     carreras_filtradas = obtener_carreras_por_grupo_y_facultad(
-        "E", st.session_state.facultad_seleccionada
+        df_vulnerabilidad["Personas"], grupo_seleccionado, facultad_seleccionada
     )
-    if st.session_state.carrera_seleccionada not in carreras_filtradas:
-        st.session_state.carrera_seleccionada = "Todos"
-    st.session_state.carrera_seleccionada = st.selectbox(
+    carrera_seleccionada = st.selectbox(
         "Carrera:",
         options=carreras_filtradas,
-        index=carreras_filtradas.index(st.session_state.carrera_seleccionada),
+        index=0,
         key="carrera_seleccionada_riesgos",
     )
 
-# Aplicar filtros
-datos_filtrados = aplicar_filtros(df_vulnerabilidad)
+# --- Aplicar filtros (igual que en Familias / Deudas) ---
+datos_filtrados = aplicar_filtros(
+    df_vulnerabilidad, grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
+)
 
-# Obtener periodos únicos de enrollment
+# --- Periodos disponibles ---
 df_personas_filtrado = datos_filtrados["Personas"]
 periodos = sorted(df_personas_filtrado["periodo"].dropna().unique().tolist())
 
 if periodos:
     st.subheader("📊 Análisis de Vulnerabilidad - Enrollment")
 
-    # Análisis para el primer periodo disponible
-    periodo = periodos[0]
+    periodo = periodos[0]  # primer periodo disponible
     st.write(f"### {periodo}")
 
     # Calcular vulnerabilidad
@@ -348,30 +347,26 @@ if periodos:
     )
 
     if not estudiantes_vulnerables.empty:
-        # Mostrar métricas generales
+        # Métricas
         total_estudiantes = len(estudiantes_vulnerables)
         estudiantes_alta_vulnerabilidad = estudiantes_vulnerables["vulnerable"].sum()
         estudiantes_en_situacion_riesgo = estudiantes_vulnerables["en_riesgo"].sum()
 
         col1, col2, col3, col4 = st.columns(4)
-
         with col1:
             tarjeta_simple("Total Estudiantes", f"{total_estudiantes}", COLORES["azul"])
-
         with col2:
             tarjeta_simple(
                 "Alta Vulnerabilidad",
                 f"{estudiantes_alta_vulnerabilidad}",
                 COLORES["rojo"],
             )
-
         with col3:
             tarjeta_simple(
                 "En Situación de Riesgo",
                 f"{estudiantes_en_situacion_riesgo}",
                 COLORES["naranja"],
             )
-
         with col4:
             estudiantes_seguros = (
                 total_estudiantes
@@ -384,37 +379,25 @@ if periodos:
 
         st.markdown("---")
 
-        # Gráfico de barras de facultades vulnerables
+        # Barras por facultad
         fig_barras = crear_barras_facultades_vulnerables(
             estudiantes_vulnerables, periodo
         )
         if fig_barras:
-            st.plotly_chart(fig_barras, width="stretch")
+            st.plotly_chart(fig_barras, use_container_width=True)
         else:
             st.info(
                 "No se encontraron estudiantes en situación vulnerable para mostrar el análisis por facultades"
             )
 
-        # Mostrar detalles de vulnerabilidad si hay estudiantes en riesgo
+        # Detalle de estudiantes
         if estudiantes_alta_vulnerabilidad > 0 or estudiantes_en_situacion_riesgo > 0:
             st.markdown("---")
             st.subheader("📋 Detalle de Estudiantes Vulnerables")
 
-            # Mostrar estudiantes con alta vulnerabilidad
+            # Alta vulnerabilidad
             estudiantes_riesgo_alto = estudiantes_vulnerables[
                 estudiantes_vulnerables["vulnerable"] == True
-            ][
-                [
-                    "identificacion",
-                    "facultad",
-                    "carrera_homologada",
-                    "motivos_vulnerabilidad",
-                ]
-            ]
-
-            # Mostrar estudiantes en situación de riesgo
-            estudiantes_riesgo_medio = estudiantes_vulnerables[
-                estudiantes_vulnerables["en_riesgo"] == True
             ][
                 [
                     "identificacion",
@@ -434,7 +417,19 @@ if periodos:
                     "Carrera",
                     "Motivos de Vulnerabilidad",
                 ]
-                st.dataframe(estudiantes_riesgo_alto, width="stretch")
+                st.dataframe(estudiantes_riesgo_alto, use_container_width=True)
+
+            # Situación de riesgo
+            estudiantes_riesgo_medio = estudiantes_vulnerables[
+                estudiantes_vulnerables["en_riesgo"] == True
+            ][
+                [
+                    "identificacion",
+                    "facultad",
+                    "carrera_homologada",
+                    "motivos_vulnerabilidad",
+                ]
+            ]
 
             if not estudiantes_riesgo_medio.empty:
                 st.write("#### 🟡 Estudiantes en Situación de Riesgo (1 condición)")
@@ -444,10 +439,9 @@ if periodos:
                     "Carrera",
                     "Motivos de Vulnerabilidad",
                 ]
-                st.dataframe(estudiantes_riesgo_medio, width="stretch")
+                st.dataframe(estudiantes_riesgo_medio, use_container_width=True)
 
     else:
         st.info("No hay datos de estudiantes disponibles para este periodo")
-
 else:
     st.write("No hay periodos disponibles para Enrollment")

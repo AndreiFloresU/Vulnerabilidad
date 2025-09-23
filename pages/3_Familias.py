@@ -4,9 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from utils.carga_datos import cargar_datos_vulnerabilidad
 from utils.filtros import (
-    inicializar_filtros,
     aplicar_filtros,
-    mostrar_filtros_en_pagina,
 )
 from utils.tarjetas import tarjeta_simple, COLORES
 import numpy as np
@@ -437,232 +435,92 @@ st.title("👨‍👩‍👧‍👦 Análisis de Familias")
 # Cargar datos
 df_vulnerabilidad = cargar_datos_vulnerabilidad()
 
-# Inicializar filtros
-inicializar_filtros(df_vulnerabilidad)
 
-# Mostrar filtros en la página principal (sin 'Graduados')
-col1, col2, col3 = st.columns(3)
-with col1:
-    opciones_grupo = {"E": "Enrollment", "A": "Afluentes"}
-    if st.session_state.grupo_interes not in opciones_grupo:
-        st.session_state.grupo_interes = "E"
-    st.session_state.grupo_interes = st.selectbox(
-        "Grupo de interés:",
-        options=list(opciones_grupo.keys()),
-        format_func=lambda x: opciones_grupo[x],
-        index=list(opciones_grupo.keys()).index(st.session_state.grupo_interes),
-        key="grupo_interes_familias",
-    )
-with col2:
-    # Facultad (filtrada según el grupo de interés)
-    from utils.filtros import obtener_facultades_por_grupo
+# Función personalizada para mostrar filtros solo para Enrollment y Afluentes
+def mostrar_filtros_familias(df_personas: pd.DataFrame, key_suffix: str = ""):
+    """
+    Muestra los filtros solo para Enrollment (E) y Afluentes (A)
+    """
+    st.header("🔍 Filtros")
 
-    facultades_filtradas = obtener_facultades_por_grupo(st.session_state.grupo_interes)
-    if st.session_state.facultad_seleccionada not in facultades_filtradas:
-        st.session_state.facultad_seleccionada = "Todos"
-    st.session_state.facultad_seleccionada = st.selectbox(
-        "Facultad:",
-        options=facultades_filtradas,
-        index=facultades_filtradas.index(st.session_state.facultad_seleccionada),
-        key="facultad_seleccionada_familias",
-    )
-with col3:
-    from utils.filtros import obtener_carreras_por_grupo_y_facultad
+    col1, col2, col3 = st.columns(3)
 
-    carreras_filtradas = obtener_carreras_por_grupo_y_facultad(
-        st.session_state.grupo_interes, st.session_state.facultad_seleccionada
-    )
-    if st.session_state.carrera_seleccionada not in carreras_filtradas:
-        st.session_state.carrera_seleccionada = "Todos"
-    st.session_state.carrera_seleccionada = st.selectbox(
-        "Carrera:",
-        options=carreras_filtradas,
-        index=carreras_filtradas.index(st.session_state.carrera_seleccionada),
-        key="carrera_seleccionada_familias",
-    )
+    with col1:
+        # Solo Enrollment y Afluentes
+        opciones_grupo = {"E": "Enrollment", "A": "Afluentes"}
+
+        grupo_seleccionado = st.selectbox(
+            "Grupo de interés:",
+            options=list(opciones_grupo.keys()),
+            format_func=lambda x: opciones_grupo[x],
+            index=0,  # Por defecto "E" (Enrollment)
+            key=f"grupo_interes_familias_{key_suffix}",
+        )
+
+    with col2:
+        # Facultad (filtrada según el grupo de interés)
+        from utils.filtros import obtener_facultades_por_grupo
+
+        facultades_disponibles = obtener_facultades_por_grupo(
+            df_personas, grupo_seleccionado
+        )
+
+        facultad_seleccionada = st.selectbox(
+            "Facultad:",
+            options=facultades_disponibles,
+            index=0,  # Por defecto "Todos"
+            key=f"facultad_familias_{key_suffix}",
+        )
+
+    with col3:
+        # Carrera (depende del grupo de interés y facultad seleccionada)
+        from utils.filtros import obtener_carreras_por_grupo_y_facultad
+
+        carreras_disponibles = obtener_carreras_por_grupo_y_facultad(
+            df_personas, grupo_seleccionado, facultad_seleccionada
+        )
+
+        carrera_seleccionada = st.selectbox(
+            "Carrera:",
+            options=carreras_disponibles,
+            index=0,  # Por defecto "Todos"
+            key=f"carrera_familias_{key_suffix}",
+        )
+
+    return grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
+
+
+# Mostrar filtros personalizados para familias
+grupo_seleccionado, facultad_seleccionada, carrera_seleccionada = (
+    mostrar_filtros_familias(df_vulnerabilidad["Personas"], key_suffix="familias")
+)
 
 # Aplicar filtros
-datos_filtrados = aplicar_filtros(df_vulnerabilidad)
+datos_filtrados = aplicar_filtros(
+    df_vulnerabilidad, grupo_seleccionado, facultad_seleccionada, carrera_seleccionada
+)
 
-# Obtener el grupo seleccionado
-grupo_seleccionado = st.session_state.grupo_interes
+# Validar que solo se muestren Afluentes y Enrollment (ya no es necesario porque los filtros solo permiten E y A)
+# El código anterior de validación se elimina porque ya no es posible seleccionar "G"
 
-# Validar que solo se muestren Afluentes y Enrollment
-if grupo_seleccionado == "G":
-    st.warning(
-        "⚠️ El análisis de familias solo está disponible para **Afluentes (A)** y **Enrollment (E)**"
-    )
-    st.info("Por favor, cambie el grupo de interés en la barra lateral.")
-else:
-    # Obtener periodos únicos del grupo seleccionado
-    df_personas_filtrado = datos_filtrados["Personas"]
-    periodos = sorted(df_personas_filtrado["periodo"].dropna().unique().tolist())
+# Obtener periodos únicos del grupo seleccionado
+df_personas_filtrado = datos_filtrados["Personas"]
+periodos = sorted(df_personas_filtrado["periodo"].dropna().unique().tolist())
 
-    if periodos:
-        st.subheader(f"📊 Análisis Familiar - {grupo_seleccionado}")
+if periodos:
+    st.subheader(f"📊 Análisis Familiar - {grupo_seleccionado}")
 
-        # Si hay al menos 2 periodos, mostrar en columnas
-        if len(periodos) >= 2:
-            # Dividir en dos columnas para mostrar los periodos
-            col1, col_divider, col2 = st.columns([1, 0.05, 1])
+    # Si hay al menos 2 periodos, mostrar en columnas
+    if len(periodos) >= 2:
+        # Dividir en dos columnas para mostrar los periodos
+        col1, col_divider, col2 = st.columns([1, 0.05, 1])
 
-            with col1:
-                st.write(f"### {periodos[0]}")
+        with col1:
+            st.write(f"### {periodos[0]}")
 
-                # Obtener datos de familias para el primer periodo
-                familias_df = obtener_datos_familias(
-                    datos_filtrados, periodos[0], grupo_seleccionado
-                )
-
-                if not familias_df.empty:
-                    # Procesar datos de empleabilidad
-                    familias_df = obtener_datos_empleabilidad_familia(
-                        datos_filtrados, familias_df
-                    )
-
-                    # Procesar datos de salario y deuda
-                    familias_df = obtener_datos_salario_deuda_familia(
-                        datos_filtrados, familias_df
-                    )
-
-                    # Mostrar métricas para primer periodo
-                    subcol1, subcol2, subcol3 = st.columns(3)
-                    with subcol1:
-                        num_hogares = contar_hogares_unicos(familias_df)
-                        tarjeta_simple(
-                            "Total Familias", f"{num_hogares:,}", COLORES["azul"]
-                        )
-                    with subcol2:
-                        salario_promedio = calcular_salario_promedio_por_hogar(
-                            familias_df
-                        )
-                        tarjeta_simple(
-                            "Ingreso Promedio Anual",
-                            f"${salario_promedio:,.0f}",
-                            COLORES["morado"],
-                        )
-                    with subcol3:
-                        mediana_salario = mediana_salario_por_hogar(familias_df)
-                        tarjeta_simple(
-                            "Ingreso Anual - Mediano",
-                            f"${mediana_salario:,.0f}",
-                            COLORES["verde"],
-                        )
-
-                else:
-                    st.info("No hay datos de familias disponibles para este periodo")
-
-            with col_divider:
-                st.markdown(
-                    """
-                <div style="
-                    border-left: 2px solid #e0e0e0;
-                    height: 300px;
-                    margin: 20px 0;
-                "></div>
-                """,
-                    unsafe_allow_html=True,
-                )
-
-            with col2:
-                st.write(f"### {periodos[1]}")
-
-                # Obtener datos de familias para el segundo periodo
-                familias_df2 = obtener_datos_familias(
-                    datos_filtrados, periodos[1], grupo_seleccionado
-                )
-
-                if not familias_df2.empty:
-                    # Procesar datos de empleabilidad
-                    familias_df2 = obtener_datos_empleabilidad_familia(
-                        datos_filtrados, familias_df2
-                    )
-
-                    # Procesar datos de salario y deuda
-                    familias_df2 = obtener_datos_salario_deuda_familia(
-                        datos_filtrados, familias_df2
-                    )
-
-                    # Mostrar métricas para segundo periodo
-                    subcol1, subcol2, subcol3 = st.columns(3)
-                    with subcol1:
-                        num_hogares2 = contar_hogares_unicos(familias_df2)
-                        tarjeta_simple(
-                            "Total Familias", f"{num_hogares2:,}", COLORES["azul"]
-                        )
-                    with subcol2:
-                        salario_promedio2 = calcular_salario_promedio_por_hogar(
-                            familias_df2
-                        )
-                        tarjeta_simple(
-                            "Ingreso Promedio Anual",
-                            f"${salario_promedio2:,.0f}",
-                            COLORES["morado"],
-                        )
-                    with subcol3:
-                        mediana_salario2 = mediana_salario_por_hogar(familias_df2)
-                        tarjeta_simple(
-                            "Ingreso Anual - Mediano",
-                            f"${mediana_salario2:,.0f}",
-                            COLORES["verde"],
-                        )
-
-                else:
-                    st.info("No hay datos de familias disponibles para este periodo")
-
-            # Scatter plot de salario vs deuda para ambos periodos
-            st.markdown("---")
-            st.subheader("📈 Relación Salario vs Deuda Familiar")
-
-            # Crear dos columnas para los scatter plots
-            scatter_col1, scatter_col2 = st.columns(2)
-
-            with scatter_col1:
-                # Scatter plot para el primer periodo
-                familias_df_scatter1 = obtener_datos_familias(
-                    datos_filtrados, periodos[0], grupo_seleccionado
-                )
-                if not familias_df_scatter1.empty:
-                    familias_df_scatter1 = obtener_datos_salario_deuda_familia(
-                        datos_filtrados, familias_df_scatter1
-                    )
-                    fig_scatter1 = crear_scatter_salario_deuda(
-                        familias_df_scatter1, periodos[0], grupo_seleccionado
-                    )
-                    if fig_scatter1:
-                        st.plotly_chart(fig_scatter1, use_container_width=True)
-                    else:
-                        st.info(
-                            "No hay datos suficientes para mostrar la relación salario-deuda"
-                        )
-
-            with scatter_col2:
-                # Scatter plot para el segundo periodo
-                familias_df_scatter2 = obtener_datos_familias(
-                    datos_filtrados, periodos[1], grupo_seleccionado
-                )
-                if not familias_df_scatter2.empty:
-                    familias_df_scatter2 = obtener_datos_salario_deuda_familia(
-                        datos_filtrados, familias_df_scatter2
-                    )
-                    fig_scatter2 = crear_scatter_salario_deuda(
-                        familias_df_scatter2, periodos[1], grupo_seleccionado
-                    )
-                    if fig_scatter2:
-                        st.plotly_chart(fig_scatter2, use_container_width=True)
-                    else:
-                        st.info(
-                            "No hay datos suficientes para mostrar la relación salario-deuda"
-                        )
-
-        else:
-            # Si hay un solo periodo o ninguno
-            periodo = periodos[0]
-            st.write(f"### {periodo}")
-
-            # Obtener datos de familias
+            # Obtener datos de familias para el primer periodo
             familias_df = obtener_datos_familias(
-                datos_filtrados, periodo, grupo_seleccionado
+                datos_filtrados, periodos[0], grupo_seleccionado
             )
 
             if not familias_df.empty:
@@ -676,24 +534,21 @@ else:
                     datos_filtrados, familias_df
                 )
 
-                # Mostrar métricas generales
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
+                # Mostrar métricas para primer periodo
+                subcol1, subcol2, subcol3 = st.columns(3)
+                with subcol1:
                     num_hogares = contar_hogares_unicos(familias_df)
                     tarjeta_simple(
                         "Total Familias", f"{num_hogares:,}", COLORES["azul"]
                     )
-
-                with col2:
+                with subcol2:
                     salario_promedio = calcular_salario_promedio_por_hogar(familias_df)
                     tarjeta_simple(
                         "Ingreso Promedio Anual",
                         f"${salario_promedio:,.0f}",
                         COLORES["morado"],
                     )
-
-                with col3:
+                with subcol3:
                     mediana_salario = mediana_salario_por_hogar(familias_df)
                     tarjeta_simple(
                         "Ingreso Anual - Mediano",
@@ -701,19 +556,169 @@ else:
                         COLORES["verde"],
                     )
 
-                # Scatter plot de salario vs deuda
-                st.markdown("---")
-                fig_scatter = crear_scatter_salario_deuda(
-                    familias_df, periodo, grupo_seleccionado
+            else:
+                st.info("No hay datos de familias disponibles para este periodo")
+
+        with col_divider:
+            st.markdown(
+                """
+            <div style="
+                border-left: 2px solid #e0e0e0;
+                height: 300px;
+                margin: 20px 0;
+            "></div>
+            """,
+                unsafe_allow_html=True,
+            )
+
+        with col2:
+            st.write(f"### {periodos[1]}")
+
+            # Obtener datos de familias para el segundo periodo
+            familias_df2 = obtener_datos_familias(
+                datos_filtrados, periodos[1], grupo_seleccionado
+            )
+
+            if not familias_df2.empty:
+                # Procesar datos de empleabilidad
+                familias_df2 = obtener_datos_empleabilidad_familia(
+                    datos_filtrados, familias_df2
                 )
-                if fig_scatter:
-                    st.plotly_chart(fig_scatter, use_container_width=True)
+
+                # Procesar datos de salario y deuda
+                familias_df2 = obtener_datos_salario_deuda_familia(
+                    datos_filtrados, familias_df2
+                )
+
+                # Mostrar métricas para segundo periodo
+                subcol1, subcol2, subcol3 = st.columns(3)
+                with subcol1:
+                    num_hogares2 = contar_hogares_unicos(familias_df2)
+                    tarjeta_simple(
+                        "Total Familias", f"{num_hogares2:,}", COLORES["azul"]
+                    )
+                with subcol2:
+                    salario_promedio2 = calcular_salario_promedio_por_hogar(
+                        familias_df2
+                    )
+                    tarjeta_simple(
+                        "Ingreso Promedio Anual",
+                        f"${salario_promedio2:,.0f}",
+                        COLORES["morado"],
+                    )
+                with subcol3:
+                    mediana_salario2 = mediana_salario_por_hogar(familias_df2)
+                    tarjeta_simple(
+                        "Ingreso Anual - Mediano",
+                        f"${mediana_salario2:,.0f}",
+                        COLORES["verde"],
+                    )
+
+            else:
+                st.info("No hay datos de familias disponibles para este periodo")
+
+        # Scatter plot de salario vs deuda para ambos periodos
+        st.markdown("---")
+        st.subheader("📈 Relación Salario vs Deuda Familiar")
+
+        # Crear dos columnas para los scatter plots
+        scatter_col1, scatter_col2 = st.columns(2)
+
+        with scatter_col1:
+            # Scatter plot para el primer periodo
+            familias_df_scatter1 = obtener_datos_familias(
+                datos_filtrados, periodos[0], grupo_seleccionado
+            )
+            if not familias_df_scatter1.empty:
+                familias_df_scatter1 = obtener_datos_salario_deuda_familia(
+                    datos_filtrados, familias_df_scatter1
+                )
+                fig_scatter1 = crear_scatter_salario_deuda(
+                    familias_df_scatter1, periodos[0], grupo_seleccionado
+                )
+                if fig_scatter1:
+                    st.plotly_chart(fig_scatter1, use_container_width=True)
                 else:
                     st.info(
                         "No hay datos suficientes para mostrar la relación salario-deuda"
                     )
 
-            else:
-                st.info("No hay datos de familias disponibles para este periodo")
+        with scatter_col2:
+            # Scatter plot para el segundo periodo
+            familias_df_scatter2 = obtener_datos_familias(
+                datos_filtrados, periodos[1], grupo_seleccionado
+            )
+            if not familias_df_scatter2.empty:
+                familias_df_scatter2 = obtener_datos_salario_deuda_familia(
+                    datos_filtrados, familias_df_scatter2
+                )
+                fig_scatter2 = crear_scatter_salario_deuda(
+                    familias_df_scatter2, periodos[1], grupo_seleccionado
+                )
+                if fig_scatter2:
+                    st.plotly_chart(fig_scatter2, use_container_width=True)
+                else:
+                    st.info(
+                        "No hay datos suficientes para mostrar la relación salario-deuda"
+                    )
+
     else:
-        st.write("No hay periodos disponibles para este grupo")
+        # Si hay un solo periodo o ninguno
+        periodo = periodos[0]
+        st.write(f"### {periodo}")
+
+        # Obtener datos de familias
+        familias_df = obtener_datos_familias(
+            datos_filtrados, periodo, grupo_seleccionado
+        )
+
+        if not familias_df.empty:
+            # Procesar datos de empleabilidad
+            familias_df = obtener_datos_empleabilidad_familia(
+                datos_filtrados, familias_df
+            )
+
+            # Procesar datos de salario y deuda
+            familias_df = obtener_datos_salario_deuda_familia(
+                datos_filtrados, familias_df
+            )
+
+            # Mostrar métricas generales
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                num_hogares = contar_hogares_unicos(familias_df)
+                tarjeta_simple("Total Familias", f"{num_hogares:,}", COLORES["azul"])
+
+            with col2:
+                salario_promedio = calcular_salario_promedio_por_hogar(familias_df)
+                tarjeta_simple(
+                    "Ingreso Promedio Anual",
+                    f"${salario_promedio:,.0f}",
+                    COLORES["morado"],
+                )
+
+            with col3:
+                mediana_salario = mediana_salario_por_hogar(familias_df)
+                tarjeta_simple(
+                    "Ingreso Anual - Mediano",
+                    f"${mediana_salario:,.0f}",
+                    COLORES["verde"],
+                )
+
+            # Scatter plot de salario vs deuda
+            st.markdown("---")
+            fig_scatter = crear_scatter_salario_deuda(
+                familias_df, periodo, grupo_seleccionado
+            )
+            if fig_scatter:
+                st.plotly_chart(fig_scatter, use_container_width=True)
+            else:
+                st.info(
+                    "No hay datos suficientes para mostrar la relación salario-deuda"
+                )
+
+        else:
+            st.info("No hay datos de familias disponibles para este periodo")
+else:
+    st.write("No hay periodos disponibles para este grupo")
